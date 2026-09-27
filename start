@@ -33,7 +33,7 @@
 #   Supervisor service name=comfyui
 #
 # Optional pin file for reproducibility (pinned nodes use a non-shallow clone):
-#   /workspace/comfyui-seed-hunter-node-pins.txt
+#  
 #   Format: one "directory=commit-or-tag" per line, e.g.
 #   rgthree-comfy=abc123...
 # ============================================================================
@@ -60,6 +60,7 @@ COMFY_PORT="${COMFY_PORT:-18188}"
 DISK_RESERVE_GB="${DISK_RESERVE_GB:-8}"
 ARIA2_SPLIT="${ARIA2_SPLIT:-8}"
 ARIA2_CONNECTIONS="${ARIA2_CONNECTIONS:-8}"
+
 CLEAN_PIP_CACHE="${CLEAN_PIP_CACHE:-true}"
 LOG_FILE="${WORKSPACE}/setup.log"
 COMFY_LOG="${WORKSPACE}/comfyui-bootstrap.log"
@@ -185,10 +186,10 @@ required_min_download_bytes() {
     done <<EOF
 $COMFY_DIR/models/checkpoints/DasiwaMinimaxH3_dasiwaHybridTurboV2_int8.safetensors|${CIVITAI_MODEL_SIZE_BYTES:-5000000000}
 $COMFY_DIR/models/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors|15000000000
-${COMFY_DIR}/user/default/workflows/Minimax_Seed_Hunter.json|${CIVITAI_WORKFLOW_SIZE_BYTES:-1024}
 $COMFY_DIR/models/latent_upscale_models/minimax_h3_latent_upscaler_3d_conv_v1_fp16.safetensors|650000000
 $COMFY_DIR/models/loras/minimax_h3_fl2v_turbo_silver_dareties_comfy_pruned_v1.safetensors|725000000
 $COMFY_DIR/models/vae/minimax_h3_video_vae_int8_convrot.safetensors|3000000000
+$COMFY_DIR/models/vae/minimax_h3_audio_vae_fp32.safetensors|605254808
 $COMFY_DIR/models/vae_approx/taeh3.safetensors|9000000
 EOF
     if [[ "$INSTALL_IMPACT_MODELS" == "true" ]]; then
@@ -752,7 +753,6 @@ mkdir -p \
     "$COMFY_DIR/models/loras" \
     "$COMFY_DIR/models/vae" \
     "$COMFY_DIR/models/vae_approx" \
-    "$COMFY_DIR/user/default/workflows"
 
 # ------------------------- Download helpers ----------------------------------
 # Fetch the primary SHA-256 recorded by Civitai for a model version.
@@ -886,6 +886,55 @@ download_file() {
     rm -f "${part}.aria2"
     echo "✅ Downloaded and verified $filename ($(human_size "$actual_size"))"
 }
+# ----------------------- Parallel download queue ------------------------------
+
+DOWNLOAD_PIDS=()
+DOWNLOAD_LABELS=()
+
+wait_for_download_slot() {
+    while ((${#DOWNLOAD_PIDS[@]} >= MAX_PARALLEL_DOWNLOADS)); do
+        local pid="${DOWNLOAD_PIDS[0]}"
+        local label="${DOWNLOAD_LABELS[0]}"
+
+        if wait "$pid"; then
+            echo "✅ Download job completed: $label"
+        else
+            echo "❌ Download job failed: $label"
+            append_failure "$label"
+        fi
+
+        DOWNLOAD_PIDS=("${DOWNLOAD_PIDS[@]:1}")
+        DOWNLOAD_LABELS=("${DOWNLOAD_LABELS[@]:1}")
+    done
+}
+
+parallel_download() {
+    local label="$1"
+    shift
+
+    download_file "$@" &
+    DOWNLOAD_PIDS+=("$!")
+    DOWNLOAD_LABELS+=("$label")
+
+    wait_for_download_slot
+}
+
+wait_for_all_downloads() {
+    while ((${#DOWNLOAD_PIDS[@]})); do
+        local pid="${DOWNLOAD_PIDS[0]}"
+        local label="${DOWNLOAD_LABELS[0]}"
+
+        if wait "$pid"; then
+            echo "✅ Download job completed: $label"
+        else
+            echo "❌ Download job failed: $label"
+            append_failure "$label"
+        fi
+
+        DOWNLOAD_PIDS=("${DOWNLOAD_PIDS[@]:1}")
+        DOWNLOAD_LABELS=("${DOWNLOAD_LABELS[@]:1}")
+    done
+}
 
 # ----------------------------- Civitai assets --------------------------------
 echo ""
@@ -893,18 +942,13 @@ echo "================ Civitai Assets ================"
 
 CIVITAI_MODEL_VERSION_ID="${CIVITAI_MODEL_VERSION_ID:-3314686}"
 CIVITAI_MODEL_FILE_ID="${CIVITAI_MODEL_FILE_ID:-3203135}"
-CIVITAI_WORKFLOW_VERSION_ID="${CIVITAI_WORKFLOW_VERSION_ID:-3337930}"
 
 CIVITAI_MODEL_SIZE_BYTES="$(civitai_size "$CIVITAI_MODEL_VERSION_ID" 2>/dev/null || true)"
-CIVITAI_WORKFLOW_SIZE_BYTES="$(civitai_size "$CIVITAI_WORKFLOW_VERSION_ID" 2>/dev/null || true)"
 if [[ -n "$CIVITAI_MODEL_SIZE_BYTES" ]]; then
     echo "📦 Civitai checkpoint size: $(human_size "$CIVITAI_MODEL_SIZE_BYTES")"
 fi
-if [[ -n "$CIVITAI_WORKFLOW_SIZE_BYTES" ]]; then
-    echo "📄 Civitai workflow size: $(human_size "$CIVITAI_WORKFLOW_SIZE_BYTES")"
-fi
 
-# Check disk immediately before the expensive model/workflow downloads.
+# Check disk immediately before the expensive model downloads.
 check_disk_space || exit 1
 
 # Verify that the version exists and obtain the server-recorded SHA-256.
@@ -915,16 +959,76 @@ CIVITAI_MODEL_SHA256="$(civitai_sha256 "$CIVITAI_MODEL_VERSION_ID" "$CIVITAI_MOD
 }
 
 if [[ -n "$CIVITAI_MODEL_SHA256" ]]; then
-    download_file \
+    parallel_download \
+        "Civitai checkpoint download"  \
         "$COMFY_DIR/models/checkpoints" \
         "DasiwaMinimaxH3_dasiwaHybridTurboV2_int8.safetensors" \
         "https://civitai.com/api/download/models/$CIVITAI_MODEL_VERSION_ID?fileId=$CIVITAI_MODEL_FILE_ID" \
         5000000000 \
         "$CIVITAI_MODEL_SHA256" \
-        civitai || append_failure "Civitai checkpoint download"
+        civitai 
 else
     echo "⏭️ Skipping checkpoint download because its expected hash could not be established."
 fi
+
+# --------------------------- Hugging Face assets -----------------------------
+echo ""
+echo "================ Hugging Face Assets ================"
+parallel_download \
+    "Qwen3-VL H3 text encoder" \
+    "$COMFY_DIR/models/text_encoders" \
+    "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors" \
+    "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors" \
+    15000000000 \
+    "35a88d51044231fe332301d7a62aa81e3f2cba62febeb446e2c1e3e0ef76f2c6" \
+    none 
+
+parallel_download \
+    "latent upscaler" \
+    "$COMFY_DIR/models/latent_upscale_models" \
+    "minimax_h3_latent_upscaler_3d_conv_v1_fp16.safetensors" \
+    "https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler/resolve/main/minimax_h3_latent_upscaler_3d_conv_v1/minimax_h3_latent_upscaler_3d_conv_v1_fp16.safetensors" \
+    650000000 \
+    "043e5a48e161610ef6c3ea974645220354d06fa618abca15f76d084812eb55c2" \
+    none 
+
+parallel_download \
+    "Turbo LoRA" \
+    "$COMFY_DIR/models/loras" \
+    "minimax_h3_fl2v_turbo_silver_dareties_comfy_pruned_v1.safetensors" \
+    "https://huggingface.co/silveroxides/MiniMax-H3_tests/resolve/main/minimax_h3_fl2v_turbo_silver_dareties_comfy_pruned_v1.safetensors" \
+    725000000 \
+    "9aab6353ce76f0a1c6a6fbbeaa1a4c60deced365e328bc14ddb0b7b9f0849b48" \
+    none 
+
+parallel_download \
+    "MiniMax H3 video VAE" \
+    "$COMFY_DIR/models/vae" \
+    "minimax_h3_video_vae_int8_convrot.safetensors" \
+    "https://huggingface.co/Kijai/MiniMax-H3-experimental/resolve/main/minimax_h3_video_vae_int8_convrot.safetensors" \
+    3000000000 \
+    "9bb2d96f218c76babd85e0611b85ca8fb330a90546c01a0005e8a58a59593410" \
+    none 
+
+parallel_download \
+    "MiniMax H3 audio VAE" \
+    "$COMFY_DIR/models/vae" \
+    "minimax_h3_audio_vae_fp32.safetensors" \
+    "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_audio_vae_fp32.safetensors" \
+    600000000 \
+    "8e505d95dd1561d47abd43d4238fd40d9bb1ae9e147ed0a4cba778d76ae4db48" \
+    none 
+
+parallel_download \
+    "TAE H3 approximate VAE" \
+    "$COMFY_DIR/models/vae_approx" \
+    "taeh3.safetensors" \
+    "https://huggingface.co/Kijai/MiniMax-H3-TAE/resolve/main/vae_approx/taeh3.safetensors" \
+    9000000 \
+    "f0f60fa072089997f817402098c2fd90777cb2660dd79cf5df42fc1e3e08e527" \
+    none 
+
+wait_for_all_downloads
 
 if [[ -f "$COMFY_DIR/models/checkpoints/DasiwaMinimaxH3_dasiwaHybridTurboV2_int8.safetensors" ]]; then
     ln -sfn \
@@ -932,81 +1036,6 @@ if [[ -f "$COMFY_DIR/models/checkpoints/DasiwaMinimaxH3_dasiwaHybridTurboV2_int8
         "$COMFY_DIR/models/diffusion_models/DasiwaMinimaxH3_dasiwaHybridTurboV2_int8.safetensors"
     echo "✅ Diffusion-model symlink created."
 fi
-
-# Workflow JSON: validate both download integrity and JSON syntax.
-CIVITAI_WORKFLOW_SHA256="$(civitai_sha256 "$CIVITAI_WORKFLOW_VERSION_ID")" || {
-    echo "❌ Could not obtain the Civitai SHA-256 for workflow version $CIVITAI_WORKFLOW_VERSION_ID."
-    append_failure "Civitai workflow metadata: $CIVITAI_WORKFLOW_VERSION_ID"
-    CIVITAI_WORKFLOW_SHA256=""
-}
-
-if [[ -n "$CIVITAI_WORKFLOW_SHA256" ]]; then
-    if ! download_file \
-        "$COMFY_DIR/user/default/workflows" \
-        "Minimax_Seed_Hunter.json" \
-        "https://civitai.com/api/download/models/$CIVITAI_WORKFLOW_VERSION_ID" \
-        1024 \
-        "$CIVITAI_WORKFLOW_SHA256" \
-        civitai; then
-        append_failure "Civitai workflow download"
-    fi
-else
-    echo "⏭️ Skipping workflow download because its expected hash could not be established."
-fi
-
-WORKFLOW_FILE="${COMFY_DIR}/user/default/workflows/Minimax_Seed_Hunter.json"
-if [[ -f "$WORKFLOW_FILE" ]]; then
-    if jq empty "$WORKFLOW_FILE" >/dev/null 2>&1; then
-        echo "✅ Workflow JSON syntax validated."
-    else
-        echo "❌ Workflow file is not valid JSON."
-        rm -f "$WORKFLOW_FILE"
-        append_failure "workflow JSON validation"
-    fi
-fi
-
-# --------------------------- Hugging Face assets -----------------------------
-echo ""
-echo "================ Hugging Face Assets ================"
-download_file \
-    "$COMFY_DIR/models/text_encoders" \
-    "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors" \
-    "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors" \
-    15000000000 \
-    "35a88d51044231fe332301d7a62aa81e3f2cba62febeb446e2c1e3e0ef76f2c6" \
-    none || append_failure "Qwen3-VL H3 text encoder"
-
-download_file \
-    "$COMFY_DIR/models/latent_upscale_models" \
-    "minimax_h3_latent_upscaler_3d_conv_v1_fp16.safetensors" \
-    "https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler/resolve/main/minimax_h3_latent_upscaler_3d_conv_v1/minimax_h3_latent_upscaler_3d_conv_v1_fp16.safetensors" \
-    650000000 \
-    "043e5a48e161610ef6c3ea974645220354d06fa618abca15f76d084812eb55c2" \
-    none || append_failure "latent upscaler"
-
-download_file \
-    "$COMFY_DIR/models/loras" \
-    "minimax_h3_fl2v_turbo_silver_dareties_comfy_pruned_v1.safetensors" \
-    "https://huggingface.co/silveroxides/MiniMax-H3_tests/resolve/main/minimax_h3_fl2v_turbo_silver_dareties_comfy_pruned_v1.safetensors" \
-    725000000 \
-    "9aab6353ce76f0a1c6a6fbbeaa1a4c60deced365e328bc14ddb0b7b9f0849b48" \
-    none || append_failure "Turbo LoRA"
-
-download_file \
-    "$COMFY_DIR/models/vae" \
-    "minimax_h3_video_vae_int8_convrot.safetensors" \
-    "https://huggingface.co/Kijai/MiniMax-H3-experimental/resolve/main/minimax_h3_video_vae_int8_convrot.safetensors" \
-    3000000000 \
-    "9bb2d96f218c76babd85e0611b85ca8fb330a90546c01a0005e8a58a59593410" \
-    none || append_failure "MiniMax H3 video VAE"
-
-download_file \
-    "$COMFY_DIR/models/vae_approx" \
-    "taeh3.safetensors" \
-    "https://huggingface.co/Kijai/MiniMax-H3-TAE/resolve/main/vae_approx/taeh3.safetensors" \
-    9000000 \
-    "f0f60fa072089997f817402098c2fd90777cb2660dd79cf5df42fc1e3e08e527" \
-    none || append_failure "TAE H3 approximate VAE"
 
 # ------------------------------- Manifest ------------------------------------
 echo ""
@@ -1040,15 +1069,15 @@ echo "================ Manifest ================"
     echo ""
     echo "[assets_sha256]"
     for f in \
-        "$COMFY_DIR/models/checkpoints/DasiwaMinimaxH3_dasiwaHybridTurboV2_int8.safetensors" \
-        "$COMFY_DIR/models/latent_upscale_models/minimax_h3_latent_upscaler_3d_conv_v1_fp16.safetensors" \
-        "$COMFY_DIR/models/loras/minimax_h3_fl2v_turbo_silver_dareties_comfy_pruned_v1.safetensors" \
-        "$COMFY_DIR/models/vae/minimax_h3_video_vae_int8_convrot.safetensors" \
-        "$COMFY_DIR/models/vae_approx/taeh3.safetensors" \
-        "$WORKFLOW_FILE"; do
-        if [[ -f "$f" ]]; then
-            echo "$(basename "$f")=$(sha256sum "$f" | awk '{print $1}')"
-        fi
+       "$COMFY_DIR/models/checkpoints/DasiwaMinimaxH3_dasiwaHybridTurboV2_int8.safetensors" \
+       "$COMFY_DIR/models/latent_upscale_models/minimax_h3_latent_upscaler_3d_conv_v1_fp16.safetensors" \
+       "$COMFY_DIR/models/loras/minimax_h3_fl2v_turbo_silver_dareties_comfy_pruned_v1.safetensors" \
+       "$COMFY_DIR/models/vae/minimax_h3_video_vae_int8_convrot.safetensors" \
+    "$COMFY_DIR/models/vae/minimax_h3_audio_vae_fp32.safetensors" \
+       "$COMFY_DIR/models/vae_approx/taeh3.safetensors"; do
+    if [[ -f "$f" ]]; then
+        echo "$(basename "$f")=$(sha256sum "$f" | awk '{print $1}')"
+    fi
     done
 } > "$MANIFEST_FILE"
 
@@ -1127,7 +1156,6 @@ cd "$ORIGINAL_DIR"
 echo ""
 echo "🎉 Setup complete."
 echo "   ComfyUI:  $COMFY_DIR"
-echo "   Workflow: $WORKFLOW_FILE"
 echo "   Setup log: $LOG_FILE"
 echo "   Manifest:  $MANIFEST_FILE"
 echo "   Comfy log: $COMFY_LOG"
