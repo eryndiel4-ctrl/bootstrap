@@ -775,7 +775,7 @@ civitai_size() {
         --retry 3 --retry-all-errors --connect-timeout 20 --max-time 60 \
         -H "Authorization: Bearer $API_TOKEN" \
         "https://civitai.com/api/v1/model-versions/mini/$version_id" | \
-        jq -er '.size // empty'
+        jq -er '.size // empty | floor'
 }
 
 download_file() {
