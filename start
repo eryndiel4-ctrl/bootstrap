@@ -183,7 +183,7 @@ required_min_download_bytes() {
         remaining=$(( min > part_size ? min - part_size : 0 ))
         total=$(( total + remaining ))
     done <<EOF
-$COMFY_DIR/models/checkpoints/dasiwa_minimax_h3.safetensors|${CIVITAI_MODEL_SIZE_BYTES:-5000000000}
+$COMFY_DIR/models/checkpoints/DasiwaMinimaxH3_dasiwaHybridTurboV2_int8.safetensors|${CIVITAI_MODEL_SIZE_BYTES:-5000000000}
 $COMFY_DIR/models/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors|15000000000
 ${COMFY_DIR}/user/default/workflows/Minimax_Seed_Hunter.json|${CIVITAI_WORKFLOW_SIZE_BYTES:-1024}
 $COMFY_DIR/models/latent_upscale_models/minimax_h3_latent_upscaler_3d_conv_v1_fp16.safetensors|650000000
@@ -910,8 +910,8 @@ CIVITAI_MODEL_SHA256="$(civitai_sha256 "$CIVITAI_MODEL_VERSION_ID")" || {
 if [[ -n "$CIVITAI_MODEL_SHA256" ]]; then
     download_file \
         "$COMFY_DIR/models/checkpoints" \
-        "dasiwa_minimax_h3.safetensors" \
-        "https://civitai.com/api/download/models/$CIVITAI_MODEL_VERSION_ID?fileId=3203313" \
+        "DasiwaMinimaxH3_dasiwaHybridTurboV2_int8.safetensors" \
+        "https://civitai.com/api/download/models/$CIVITAI_MODEL_VERSION_ID?fileId=3203135" \
         5000000000 \
         "$CIVITAI_MODEL_SHA256" \
         civitai || append_failure "Civitai checkpoint download"
@@ -919,10 +919,10 @@ else
     echo "⏭️ Skipping checkpoint download because its expected hash could not be established."
 fi
 
-if [[ -f "$COMFY_DIR/models/checkpoints/dasiwa_minimax_h3.safetensors" ]]; then
+if [[ -f "$COMFY_DIR/models/checkpoints/DasiwaMinimaxH3_dasiwaHybridTurboV2_int8.safetensors" ]]; then
     ln -sfn \
-        "$COMFY_DIR/models/checkpoints/dasiwa_minimax_h3.safetensors" \
-        "$COMFY_DIR/models/diffusion_models/dasiwa_minimax_h3.safetensors"
+        "$COMFY_DIR/models/checkpoints/DasiwaMinimaxH3_dasiwaHybridTurboV2_int8.safetensors" \
+        "$COMFY_DIR/models/diffusion_models/DasiwaMinimaxH3_dasiwaHybridTurboV2_int8.safetensors"
     echo "✅ Diffusion-model symlink created."
 fi
 
@@ -1033,7 +1033,7 @@ echo "================ Manifest ================"
     echo ""
     echo "[assets_sha256]"
     for f in \
-        "$COMFY_DIR/models/checkpoints/dasiwa_minimax_h3.safetensors" \
+        "$COMFY_DIR/models/checkpoints/DasiwaMinimaxH3_dasiwaHybridTurboV2_int8.safetensors" \
         "$COMFY_DIR/models/latent_upscale_models/minimax_h3_latent_upscaler_3d_conv_v1_fp16.safetensors" \
         "$COMFY_DIR/models/loras/minimax_h3_fl2v_turbo_silver_dareties_comfy_pruned_v1.safetensors" \
         "$COMFY_DIR/models/vae/minimax_h3_video_vae_int8_convrot.safetensors" \
