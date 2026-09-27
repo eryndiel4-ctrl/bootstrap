@@ -834,7 +834,7 @@ download_file() {
 
     if [[ "$auth_mode" == "civitai" ]]; then
         echo "⬇️ Downloading Civitai asset with curl..."
-        if ! curl -fL --location-trusted \
+        if ! curl -fL \
             --retry 3 \
             --retry-all-errors \
             --connect-timeout 30 \
