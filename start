@@ -911,7 +911,7 @@ if [[ -n "$CIVITAI_MODEL_SHA256" ]]; then
     download_file \
         "$COMFY_DIR/models/checkpoints" \
         "dasiwa_minimax_h3.safetensors" \
-        "https://civitai.com/api/download/models/$CIVITAI_MODEL_VERSION_ID" \
+        "https://civitai.com/api/download/models/$CIVITAI_MODEL_VERSION_ID?fileId=3203313" \
         5000000000 \
         "$CIVITAI_MODEL_SHA256" \
         civitai || append_failure "Civitai checkpoint download"
