@@ -834,7 +834,7 @@ download_file() {
 
     if [[ "$auth_mode" == "civitai" ]]; then
         echo "⬇️ Downloading Civitai asset with curl..."
-        if ! curl -fL \
+        if ! curl -fL --location-trusted \
             --retry 3 \
             --retry-all-errors \
             --connect-timeout 30 \
@@ -885,7 +885,7 @@ download_file() {
 echo ""
 echo "================ Civitai Assets ================"
 
-CIVITAI_MODEL_VERSION_ID="${CIVITAI_MODEL_VERSION_ID:-3314675}"
+CIVITAI_MODEL_VERSION_ID="${CIVITAI_MODEL_VERSION_ID:-3314686}"
 CIVITAI_WORKFLOW_VERSION_ID="${CIVITAI_WORKFLOW_VERSION_ID:-3337930}"
 
 CIVITAI_MODEL_SIZE_BYTES="$(civitai_size "$CIVITAI_MODEL_VERSION_ID" 2>/dev/null || true)"
