@@ -668,7 +668,7 @@ verify_node_install() {
             ;;
 
         ComfyUI-Impact-Pack)
-            if ! PYTHONPATH="$dest/modules${PYTHONPATH:+:$PYTHONPATH}" \
+            if ! PYTHONPATH="$COMFY_DIR/custom_nodes/$node_dir/modules${PYTHONPATH:+:$PYTHONPATH}" \
                 "$PYTHON_CMD" -c 'import impact.config' >/dev/null 2>&1; then
                 echo "❌ Impact Pack import verification failed."
                 return 1
