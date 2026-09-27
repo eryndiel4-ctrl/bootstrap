@@ -828,64 +828,24 @@ download_file() {
         --out=".${filename}.part"
     )
 
-       if [[ "$auth_mode" == "civitai" ]]; then
-        echo "🔐 Resolving Civitai signed download URL..."
+           if [[ "$auth_mode" == "civitai" ]]; then
+        aria_args+=(--header="Authorization: Bearer $API_TOKEN")
+    fi
 
-        local resolved_url
-        resolved_url="$(
-            curl -fsS \
-                --retry 3 \
-                --retry-all-errors \
-                --connect-timeout 30 \
-                --max-time 60 \
-                -H "Authorization: Bearer $API_TOKEN" \
-                -D - \
-                -o /dev/null \
-                "$url" |
-            awk 'BEGIN { IGNORECASE=1 }
-                 /^location:/ {
-                     sub(/\r$/, "", $0)
-                     sub(/^[^:]*:[[:space:]]*/, "", $0)
-                     print
-                     exit
-                 }'
-        )"
-
-        if [[ -z "$resolved_url" ]]; then
-            echo "❌ Civitai did not return a signed download URL."
-            rm -f "$part" "${part}.aria2"
+    if [[ "$auth_mode" == "civitai" ]]; then
+        echo "⬇️ Downloading Civitai asset with curl..."
+        if ! curl -fL \
+            --retry 3 \
+            --retry-all-errors \
+            --connect-timeout 30 \
+            --max-time 0 \
+            --continue-at - \
+            -H "Authorization: Bearer $API_TOKEN" \
+            -o "$part" \
+            "$url"; then
+            echo "❌ Failed to download $filename from Civitai"
+            rm -f "$part"
             return 1
-        fi
-
-        echo "⬇️ Downloading Civitai asset with aria2c..."
-
-        if ! aria2c "${aria_args[@]}" "$resolved_url"; then
-            echo "⚠️ aria2c failed with the first signed URL; resolving a fresh URL..."
-
-            resolved_url="$(
-                curl -fsS \
-                    --retry 3 \
-                    --retry-all-errors \
-                    --connect-timeout 30 \
-                    --max-time 60 \
-                    -H "Authorization: Bearer $API_TOKEN" \
-                    -D - \
-                    -o /dev/null \
-                    "$url" |
-                awk 'BEGIN { IGNORECASE=1 }
-                     /^location:/ {
-                         sub(/\r$/, "", $0)
-                         sub(/^[^:]*:[[:space:]]*/, "", $0)
-                         print
-                         exit
-                     }'
-            )"
-
-            if [[ -z "$resolved_url" ]] || ! aria2c "${aria_args[@]}" "$resolved_url"; then
-                rm -f "$part" "${part}.aria2"
-                echo "❌ Failed to download $filename from Civitai with aria2c."
-                return 1
-            fi
         fi
     else
         if ! aria2c "${aria_args[@]}" "$url"; then
