@@ -826,30 +826,34 @@ download_file() {
         aria_args+=(--header="Authorization: Bearer $API_TOKEN")
     fi
 
+   if [[ "$auth_mode" == "civitai" ]]; then
+    echo "⬇️ Downloading Civitai asset with curl..."
+    if ! curl -fL \
+        --retry 3 \
+        --retry-all-errors \
+        --connect-timeout 30 \
+        --max-time 0 \
+        --continue-at - \
+        -H "Authorization: Bearer $API_TOKEN" \
+        -o "$part" \
+        "$url"; then
+        echo "❌ Failed to download $filename from Civitai"
+        rm -f "$part"
+        return 1
+    fi
+else
     if ! aria2c "${aria_args[@]}" "$url"; then
         echo "⚠️ aria2c failed for $filename; falling back to wget..."
         rm -f "${part}.aria2"
 
-        if [[ "$auth_mode" == "civitai" ]]; then
-            local -a wget_args=(
-                --no-verbose
-                --show-progress
-                --continue
-                --tries=3
-                --timeout=60
-                --header="Authorization: Bearer $API_TOKEN"
-                -O "$part"
-            )
-        else
-            local -a wget_args=(
-                --no-verbose
-                --show-progress
-                --continue
-                --tries=3
-                --timeout=60
-                -O "$part"
-            )
-        fi
+        local -a wget_args=(
+            --no-verbose
+            --show-progress
+            --continue
+            --tries=3
+            --timeout=60
+            -O "$part"
+        )
 
         if ! wget "${wget_args[@]}" "$url"; then
             rm -f "$part" "${part}.aria2"
@@ -857,17 +861,18 @@ download_file() {
             return 1
         fi
     fi
+fi
 
-    if ! verify_file "$part" "$min_bytes" "$expected_sha256"; then
-        echo "❌ Downloaded $filename failed validation."
-        rm -f "$part" "${part}.aria2"
-        return 1
-    fi
+if ! verify_file "$part" "$min_bytes" "$expected_sha256"; then
+    echo "❌ Downloaded $filename failed validation."
+    rm -f "$part" "${part}.aria2"
+    return 1
+fi
 
-    actual_size="$(file_size "$part")"
-    mv -f "$part" "$dest"
-    rm -f "${part}.aria2"
-    echo "✅ Downloaded and verified $filename ($(human_size "$actual_size"))"
+actual_size="$(file_size "$part")"
+mv -f "$part" "$dest"
+rm -f "${part}.aria2"
+echo "✅ Downloaded and verified $filename ($(human_size "$actual_size"))"
 }
 
 # ----------------------------- Civitai assets --------------------------------
