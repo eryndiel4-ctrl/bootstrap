@@ -295,7 +295,7 @@ if ! command -v "$UV_CMD" >/dev/null 2>&1; then
     echo "❌ uv is not available in the Vast.ai official image."
     exit 1
 fi
-if ! "$UV_CMD" pip --version >/dev/null 2>&1; then
+if ! "$UV_CMD" pip --help >/dev/null 2>&1; then
     echo "❌ uv's pip interface is not available."
     exit 1
 fi
