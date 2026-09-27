@@ -614,7 +614,11 @@ install_node_dependencies() {
 
         ComfyUI-Pixaroma)
             # Pixaroma declares imageio-ffmpeg in pyproject.toml.
-            uv_pip install --no-cache -e "$dest"
+            uv_pip install --no-cache -r "$dest/requirements.txt"
+            ;;
+
+        ComfyUI-H3-Prompt-IDE)
+            echo "   ℹ️ H3 Prompt IDE has no Python dependencies; skipping package installation."
             ;;
 
         *)
@@ -664,7 +668,8 @@ verify_node_install() {
             ;;
 
         ComfyUI-Impact-Pack)
-            if ! "$PYTHON_CMD" -c 'import impact.config' >/dev/null 2>&1; then
+            if ! PYTHONPATH="$dest/modules${PYTHONPATH:+:$PYTHONPATH}" \
+                "$PYTHON_CMD" -c 'import impact.config' >/dev/null 2>&1; then
                 echo "❌ Impact Pack import verification failed."
                 return 1
             fi
