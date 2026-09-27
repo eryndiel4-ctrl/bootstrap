@@ -760,13 +760,19 @@ mkdir -p \
 # version ID, while keeping the token out of the URL.
 civitai_sha256() {
     local version_id="$1"
+    local file_id="$2"
     local metadata
+
     metadata="$(curl -fsSL \
         --retry 3 --retry-all-errors --connect-timeout 20 --max-time 60 \
         -H "Authorization: Bearer $API_TOKEN" \
-        "https://civitai.com/api/v1/model-versions/mini/$version_id")"
+        "https://civitai.com/api/v1/model-versions/$version_id")"
 
-    jq -er '.hashes.SHA256 // empty' <<<"$metadata"
+    jq -er --argjson file_id "$file_id" '
+        .files[]
+        | select(.id == $file_id)
+        | .hashes.SHA256 // empty
+    ' <<<"$metadata"
 }
 
 civitai_size() {
@@ -886,6 +892,7 @@ echo ""
 echo "================ Civitai Assets ================"
 
 CIVITAI_MODEL_VERSION_ID="${CIVITAI_MODEL_VERSION_ID:-3314686}"
+CIVITAI_MODEL_FILE_ID="${CIVITAI_MODEL_FILE_ID:-3203135}"
 CIVITAI_WORKFLOW_VERSION_ID="${CIVITAI_WORKFLOW_VERSION_ID:-3337930}"
 
 CIVITAI_MODEL_SIZE_BYTES="$(civitai_size "$CIVITAI_MODEL_VERSION_ID" 2>/dev/null || true)"
@@ -901,7 +908,7 @@ fi
 check_disk_space || exit 1
 
 # Verify that the version exists and obtain the server-recorded SHA-256.
-CIVITAI_MODEL_SHA256="$(civitai_sha256 "$CIVITAI_MODEL_VERSION_ID")" || {
+CIVITAI_MODEL_SHA256="$(civitai_sha256 "$CIVITAI_MODEL_VERSION_ID" "$CIVITAI_MODEL_FILE_ID")" || {
     echo "❌ Could not obtain the Civitai SHA-256 for version $CIVITAI_MODEL_VERSION_ID."
     append_failure "Civitai model metadata: $CIVITAI_MODEL_VERSION_ID"
     CIVITAI_MODEL_SHA256=""
@@ -911,7 +918,7 @@ if [[ -n "$CIVITAI_MODEL_SHA256" ]]; then
     download_file \
         "$COMFY_DIR/models/checkpoints" \
         "DasiwaMinimaxH3_dasiwaHybridTurboV2_int8.safetensors" \
-        "https://civitai.com/api/download/models/$CIVITAI_MODEL_VERSION_ID?fileId=3203135" \
+        "https://civitai.com/api/download/models/$CIVITAI_MODEL_VERSION_ID?fileId=$CIVITAI_MODEL_FILE_ID" \
         5000000000 \
         "$CIVITAI_MODEL_SHA256" \
         civitai || append_failure "Civitai checkpoint download"
