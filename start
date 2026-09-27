@@ -1,0 +1,1109 @@
+#!/usr/bin/env bash
+# ============================================================================
+# Vast.ai Official ComfyUI Ephemeral Bootstrap
+# Workflow: MiniMax H3 / Seed Hunter
+#
+# Designed for Vast.ai's official ComfyUI image (vastai/comfy), while retaining
+# compatibility with manual execution inside a matching Vast.ai ComfyUI image.
+#
+# Intended use:
+#   Set PROVISIONING_SCRIPT to this script's public/raw URL in the Vast.ai
+#   official ComfyUI template, then create a fresh instance.
+#
+# Required environment variable:
+#   CIVITAI_TOKEN  (or CIVITAI_API_TOKEN)
+#
+# Optional environment variables:
+#   FORCE_REINSTALL=true          # Remove ONLY this script's managed nodes first
+#   UPDATE_NODES=true             # Update existing managed git nodes to latest remote
+#   INSTALL_IMPACT_MODELS=false   # Set true only when Impact Pack's SAM assets are wanted
+#   RESTART_COMFY=auto            # auto/true/false; Vast uses Supervisor to manage ComfyUI
+#   FRAME_INTERPOLATION_CUDA13=auto
+#   READY_TIMEOUT=300             # Seconds to wait for the Vast ComfyUI workspace
+#   DISK_RESERVE_GB=8             # Free-space safety margin for pip/git/temp files
+#   ARIA2_SPLIT=8                 # Parallel pieces for large downloads when supported
+#   ARIA2_CONNECTIONS=8           # Connections per server for aria2
+#   CLEAN_PIP_CACHE=true          # Purge pip cache after dependency installation
+#
+# Vast.ai official ComfyUI defaults used by this script:
+#   WORKSPACE=/workspace
+#   COMFYUI_DIR=/workspace/ComfyUI
+#   PYTHON=/venv/main/bin/python
+#   ComfyUI internal port=18188 (Vast maps it externally as port 8188)
+#   Supervisor service name=comfyui
+#
+# Optional pin file for reproducibility (pinned nodes use a non-shallow clone):
+#   /workspace/comfyui-seed-hunter-node-pins.txt
+#   Format: one "directory=commit-or-tag" per line, e.g.
+#   rgthree-comfy=abc123...
+# ============================================================================
+
+set -Eeuo pipefail
+
+# Vast writes instance/account environment variables to /etc/environment.
+# Source it before resolving our defaults so a custom WORKSPACE is respected.
+if [[ -f /etc/environment ]]; then
+    # shellcheck disable=SC1091
+    source /etc/environment
+fi
+
+# ------------------------------- Settings -----------------------------------
+WORKSPACE="${WORKSPACE:-/workspace}"
+COMFY_DIR="${COMFYUI_DIR:-${WORKSPACE}/ComfyUI}"
+FORCE_REINSTALL="${FORCE_REINSTALL:-false}"
+UPDATE_NODES="${UPDATE_NODES:-false}"
+INSTALL_IMPACT_MODELS="${INSTALL_IMPACT_MODELS:-false}"
+RESTART_COMFY="${RESTART_COMFY:-auto}"
+FRAME_INTERPOLATION_CUDA13="${FRAME_INTERPOLATION_CUDA13:-auto}"
+READY_TIMEOUT="${READY_TIMEOUT:-300}"
+COMFY_PORT="${COMFY_PORT:-18188}"
+DISK_RESERVE_GB="${DISK_RESERVE_GB:-8}"
+ARIA2_SPLIT="${ARIA2_SPLIT:-8}"
+ARIA2_CONNECTIONS="${ARIA2_CONNECTIONS:-8}"
+CLEAN_PIP_CACHE="${CLEAN_PIP_CACHE:-true}"
+LOG_FILE="${WORKSPACE}/setup.log"
+COMFY_LOG="${WORKSPACE}/comfyui-bootstrap.log"
+PIN_FILE="${WORKSPACE}/comfyui-seed-hunter-node-pins.txt"
+MANIFEST_FILE="${WORKSPACE}/comfyui-seed-hunter-manifest.txt"
+LOCK_DIR="${WORKSPACE}/.seed_hunter_setup.lock"
+
+ORIGINAL_DIR="$(pwd)"
+mkdir -p "$WORKSPACE"
+
+# Log to both terminal and persistent workspace file.
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+# ----------------------------- Error handling -------------------------------
+on_error() {
+    local exit_code=$?
+    echo ""
+    echo "❌ Setup aborted (exit code $exit_code at line ${BASH_LINENO[0]:-unknown})."
+    echo "   See: $LOG_FILE"
+    exit "$exit_code"
+}
+trap on_error ERR
+
+cleanup_lock() {
+    rm -rf "$LOCK_DIR"
+}
+trap cleanup_lock EXIT
+
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    echo "❌ Another Seed Hunter setup may already be running."
+    echo "   Lock: $LOCK_DIR"
+    exit 1
+fi
+
+# --------------------------- Required credentials ---------------------------
+API_TOKEN="${CIVITAI_TOKEN:-${CIVITAI_API_TOKEN:-}}"
+if [[ -z "$API_TOKEN" ]]; then
+    echo "❌ CIVITAI_TOKEN/CIVITAI_API_TOKEN is not set."
+    echo "   Add it to the Vast.ai template / Account Environment Variables before provisioning."
+    exit 1
+fi
+
+# -------------------------- Utility functions --------------------------------
+human_size() {
+    numfmt --to=iec --suffix=B "$1" 2>/dev/null || printf '%s bytes\n' "$1"
+}
+
+file_size() {
+    stat -c%s "$1" 2>/dev/null || stat -f%z "$1" 2>/dev/null || echo 0
+}
+
+append_failure() {
+    FAILED_ITEMS+=("$1")
+}
+
+# Verify that a file satisfies both size and optional SHA-256 requirements.
+verify_file() {
+    local file="$1"
+    local min_bytes="$2"
+    local expected_sha256="${3:-}"
+    local actual_size
+    actual_size="$(file_size "$file")"
+
+    if [[ ! -f "$file" ]]; then
+        return 1
+    fi
+
+    if (( actual_size < min_bytes )); then
+        echo "   ⚠️ File is too small: $(human_size "$actual_size") (minimum $(human_size "$min_bytes"))"
+        return 1
+    fi
+
+    if [[ -n "$expected_sha256" ]]; then
+        local actual_sha256
+        actual_sha256="$(sha256sum "$file" | awk '{print $1}')"
+        if [[ "${actual_sha256,,}" != "${expected_sha256,,}" ]]; then
+            echo "   ❌ SHA-256 mismatch"
+            echo "      expected: $expected_sha256"
+            echo "      actual:   $actual_sha256"
+            return 1
+        fi
+    fi
+
+    return 0
+}
+
+validate_torch_environment() {
+    local actual cuda_available torch_location
+    actual="$($PYTHON_CMD -c 'import torch; print("cu" + torch.version.cuda.replace(".", "")) if torch.version.cuda else print("cpu")' 2>/dev/null || echo unknown)"
+    cuda_available="$($PYTHON_CMD -c 'import torch; print(torch.cuda.is_available())' 2>/dev/null || echo unknown)"
+    torch_location="$($PYTHON_CMD -c 'import torch, os; print(os.path.realpath(torch.__file__))' 2>/dev/null || echo unknown)"
+
+    echo "✅ Active torch CUDA build: $actual"
+    echo "✅ CUDA available: $cuda_available"
+    echo "✅ Torch location: $torch_location"
+
+    if [[ "$cuda_available" != "True" ]]; then
+        echo "❌ PyTorch cannot access CUDA in the detected Vast.ai environment."
+        return 1
+    fi
+
+    return 0
+}
+
+free_bytes() {
+    df -P -B1 "$COMFY_DIR" | awk 'NR==2 {print $4}'
+}
+
+required_min_download_bytes() {
+    local total=0 file min part part_size remaining
+    while IFS='|' read -r file min; do
+        [[ -z "$file" ]] && continue
+        if [[ -f "$file" ]] && verify_file "$file" "$min" >/dev/null 2>&1; then
+            continue
+        fi
+        part="$(dirname "$file")/.${file##*/}.part"
+        part_size=0
+        if [[ -f "$part" ]]; then
+            part_size="$(file_size "$part")"
+        fi
+        remaining=$(( min > part_size ? min - part_size : 0 ))
+        total=$(( total + remaining ))
+    done <<EOF
+$COMFY_DIR/models/checkpoints/dasiwa_minimax_h3.safetensors|${CIVITAI_MODEL_SIZE_BYTES:-5000000000}
+${COMFY_DIR}/user/default/workflows/Minimax_Seed_Hunter.json|${CIVITAI_WORKFLOW_SIZE_BYTES:-1024}
+$COMFY_DIR/models/latent_upscale_models/minimax_h3_latent_upscaler_3d_conv_v1_fp16.safetensors|650000000
+$COMFY_DIR/models/loras/minimax_h3_fl2v_turbo_silver_dareties_comfy_pruned_v1.safetensors|725000000
+$COMFY_DIR/models/vae/minimax_h3_video_vae_int8_convrot.safetensors|3000000000
+$COMFY_DIR/models/vae_approx/taeh3.safetensors|9000000
+EOF
+    if [[ "$INSTALL_IMPACT_MODELS" == "true" ]]; then
+        total=$(( total + 500000000 ))
+    fi
+    printf '%s\n' "$total"
+}
+
+check_disk_space() {
+    local free needed reserve
+    free="$(free_bytes)"
+    reserve=$(( DISK_RESERVE_GB * 1000000000 ))
+    needed=$(( $(required_min_download_bytes) + reserve ))
+    echo "💾 Free space on ComfyUI filesystem: $(human_size "$free")"
+    echo "💾 Minimum remaining asset space + reserve: $(human_size "$needed")"
+    if (( free < needed )); then
+        echo "❌ Not enough free disk space for the planned asset bundle."
+        echo "   Increase pod disk size or lower DISK_RESERVE_GB."
+        return 1
+    fi
+}
+
+# ------------------------- ComfyUI path discovery ----------------------------
+find_comfy_dir() {
+    local candidates=(
+        "$COMFY_DIR"
+        "${WORKSPACE}/ComfyUI"
+    )
+    local d
+    for d in "${candidates[@]}"; do
+        if [[ -d "$d" && -f "$d/main.py" ]]; then
+            printf '%s\n' "$d"
+            return 0
+        fi
+    done
+    return 1
+}
+
+find_python() {
+    local comfy_dir="$1"
+    local candidates=()
+    shopt -s nullglob
+    candidates+=("/venv/main/bin/python")
+    candidates+=("$comfy_dir"/.venv-cu*/bin/python)
+    candidates+=("$comfy_dir"/.venv/bin/python)
+    candidates+=("${WORKSPACE}/venv/bin/python")
+    candidates+=("/usr/local/bin/python3")
+    candidates+=("/usr/bin/python3")
+
+    local p
+    for p in "${candidates[@]}"; do
+        if [[ -x "$p" ]]; then
+            printf '%s\n' "$p"
+            return 0
+        fi
+    done
+    return 1
+}
+
+wait_for_comfy_workspace() {
+    local elapsed=0
+    local comfy_dir=""
+
+    while (( elapsed < READY_TIMEOUT )); do
+        if comfy_dir="$(find_comfy_dir 2>/dev/null)"; then
+            COMFY_DIR="$comfy_dir"
+            if PYTHON_CMD="$(find_python "$COMFY_DIR" 2>/dev/null)"; then
+                echo "✅ ComfyUI workspace ready: $COMFY_DIR"
+                echo "✅ Python detected: $PYTHON_CMD"
+                return 0
+            fi
+        fi
+
+        sleep 3
+        elapsed=$((elapsed + 3))
+        echo "⏳ Waiting for Vast.ai ComfyUI workspace... ${elapsed}s/${READY_TIMEOUT}s"
+    done
+
+    return 1
+}
+
+
+# ---------------------------- Initial checks ---------------------------------
+echo ""
+echo "==============================================================="
+echo "🚀 MiniMax H3 / Seed Hunter Vast.ai setup"
+echo "==============================================================="
+echo ""
+echo "Vast.ai official ComfyUI provisioning may still be completing."
+wait_for_comfy_workspace || {
+    echo "❌ Could not find a ready ComfyUI workspace."
+    echo "   Expected: ${WORKSPACE}/ComfyUI"
+    echo "   Increase READY_TIMEOUT if the image is still initializing."
+    exit 1
+}
+
+if [[ ! -x "$PYTHON_CMD" ]]; then
+    echo "❌ ComfyUI Python executable is not usable: $PYTHON_CMD"
+    exit 1
+fi
+
+# Vast's official images provide uv; use it for all Python package operations.
+UV_CMD="${UV_CMD:-uv}"
+if ! command -v "$UV_CMD" >/dev/null 2>&1; then
+    echo "❌ uv is not available in the Vast.ai official image."
+    exit 1
+fi
+if ! "$UV_CMD" pip --version >/dev/null 2>&1; then
+    echo "❌ uv's pip interface is not available."
+    exit 1
+fi
+echo "✅ uv detected: $(command -v "$UV_CMD")"
+
+PYTHON_BIN_DIR="$(dirname "$PYTHON_CMD")"
+VENV_DIR="$(dirname "$PYTHON_BIN_DIR")"
+if [[ -f "$VENV_DIR/bin/activate" ]]; then
+    # shellcheck disable=SC1090
+    source "$VENV_DIR/bin/activate"
+    echo "✅ Activated ComfyUI venv: $VENV_DIR"
+fi
+
+# Use the image-provided uv pip interface with an explicit target interpreter.
+uv_pip() {
+    "$UV_CMD" pip "$@" --python "$PYTHON_CMD"
+}
+
+# Vast's official image owns the PyTorch/CUDA stack. Protect the image-baked
+# torch family from custom-node installers by constraining already-installed
+# core packages instead of replacing them with arbitrary resolver choices.
+PIP_CONSTRAINT_FILE="${WORKSPACE}/.seed_hunter-vast-pip-constraints.txt"
+: > "$PIP_CONSTRAINT_FILE"
+for pkg in torch torchvision torchaudio triton xformers; do
+    if installed_ver="$(uv_pip show "$pkg" 2>/dev/null | sed -n 's/^Version: //p' | head -n1)" && [[ -n "$installed_ver" ]]; then
+        printf '%s==%s\n' "$pkg" "$installed_ver" >> "$PIP_CONSTRAINT_FILE"
+    fi
+done
+export UV_CONSTRAINT="$PIP_CONSTRAINT_FILE"
+echo "✅ Protecting image-baked core packages with uv constraint: $PIP_CONSTRAINT_FILE"
+
+# ----------------------- System dependency bootstrap -------------------------
+# Install host utilities only after Vast.ai's own workspace/bootstrap is ready,
+# so apt activity cannot compete with the template's first-boot migration.
+MISSING_PKGS=()
+command -v git >/dev/null 2>&1 || MISSING_PKGS+=(git)
+command -v curl >/dev/null 2>&1 || MISSING_PKGS+=(curl)
+command -v wget >/dev/null 2>&1 || MISSING_PKGS+=(wget)
+command -v aria2c >/dev/null 2>&1 || MISSING_PKGS+=(aria2)
+command -v jq >/dev/null 2>&1 || MISSING_PKGS+=(jq)
+command -v sha256sum >/dev/null 2>&1 || MISSING_PKGS+=(coreutils)
+command -v numfmt >/dev/null 2>&1 || MISSING_PKGS+=(coreutils)
+
+if ((${#MISSING_PKGS[@]})); then
+    mapfile -t MISSING_PKGS < <(printf '%s\n' "${MISSING_PKGS[@]}" | sort -u)
+    echo "📦 Installing missing system packages: ${MISSING_PKGS[*]}"
+    apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${MISSING_PKGS[@]}" >/dev/null
+fi
+
+# Stop ComfyUI before modifying custom nodes or the shared Python environment.
+# Respect RESTART_COMFY=false so an explicitly requested stopped/untouched service
+# is not unexpectedly left running/stopped by this bootstrap.
+COMFY_STOPPED_BY_SCRIPT=false
+stop_comfy_for_setup() {
+    if [[ "$RESTART_COMFY" == "false" ]]; then
+        echo "ℹ️ RESTART_COMFY=false; leaving the current ComfyUI service untouched."
+        return 0
+    fi
+
+    if ! command -v supervisorctl >/dev/null 2>&1; then
+        echo "ℹ️ supervisorctl is unavailable; continuing without stopping ComfyUI first."
+        return 0
+    fi
+
+    local status
+    status="$(supervisorctl status comfyui 2>/dev/null || true)"
+    if [[ "$status" == comfyui[[:space:]]RUNNING* ]]; then
+        echo "🛑 Stopping ComfyUI before package/node changes..."
+        if supervisorctl stop comfyui >/dev/null; then
+            COMFY_STOPPED_BY_SCRIPT=true
+            echo "✅ ComfyUI stopped."
+        else
+            echo "❌ Could not stop the ComfyUI Supervisor service."
+            return 1
+        fi
+    else
+        echo "ℹ️ ComfyUI service is not currently RUNNING; no stop needed."
+    fi
+}
+
+stop_comfy_for_setup || exit 1
+
+# ------------------------ Managed custom nodes -------------------------------
+REPOS=(
+    "https://github.com/rgthree/rgthree-comfy.git"
+    "https://github.com/Fannovel16/ComfyUI-Frame-Interpolation.git"
+    "https://github.com/ltdrdata/ComfyUI-Impact-Pack.git"
+    "https://github.com/chrisgoringe/cg-use-everywhere.git"
+    "https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler.git"
+    "https://github.com/pixaroma/ComfyUI-Pixaroma.git"
+    "https://github.com/ethanfel/ComfyUI-H3-Prompt-IDE.git"
+    "https://github.com/Adudeguyman/ComfyUI-Fantastic-MiniMaxH3-PromptBuilder.git"
+    "https://github.com/Luisacaotica/ComfyUI-MiniMaxH3Mod.git"
+    "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git"
+)
+
+MANAGED_NODE_DIRS=(
+    "rgthree-comfy"
+    "ComfyUI-Frame-Interpolation"
+    "ComfyUI-Impact-Pack"
+    "cg-use-everywhere"
+    "Comfyui_Minimax_h3_latent_Upscaler"
+    "ComfyUI-Pixaroma"
+    "ComfyUI-H3-Prompt-IDE"
+    "ComfyUI-Fantastic-MiniMaxH3-PromptBuilder"
+    "ComfyUI-MiniMaxH3Mod"
+    "ComfyUI-VideoHelperSuite"
+)
+
+FAILED_ITEMS=()
+mkdir -p "$COMFY_DIR/custom_nodes"
+
+# -------------------------- CUDA / GPU detection -----------------------------
+# Use the CUDA version that the active PyTorch build was compiled for when
+# choosing Python CUDA wheels. Also report the physical NVIDIA driver/GPU.
+TORCH_CUDA_VERSION="$($PYTHON_CMD -c 'import torch; print(torch.version.cuda or "unknown")' 2>/dev/null || echo unknown)"
+TORCH_VERSION="$($PYTHON_CMD -c 'import torch; print(torch.__version__)' 2>/dev/null || echo unknown)"
+CUDA_AVAILABLE="$($PYTHON_CMD -c 'import torch; print(torch.cuda.is_available())' 2>/dev/null || echo unknown)"
+GPU_NAME="$($PYTHON_CMD -c 'import torch; print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else "none")' 2>/dev/null || echo unknown)"
+
+echo "✅ PyTorch version: $TORCH_VERSION"
+echo "✅ PyTorch CUDA build: $TORCH_CUDA_VERSION"
+echo "✅ PyTorch CUDA available: $CUDA_AVAILABLE"
+echo "✅ GPU: $GPU_NAME"
+
+DRIVER_CUDA_VERSION="unknown"
+if command -v nvidia-smi >/dev/null 2>&1; then
+    DRIVER_CUDA_VERSION="$(nvidia-smi --query-gpu=cuda_version --format=csv,noheader 2>/dev/null | head -n1 || echo unknown)"
+    echo "✅ NVIDIA driver-reported CUDA compatibility: $DRIVER_CUDA_VERSION"
+fi
+
+case "$TORCH_CUDA_VERSION" in
+    13.*) CUDA_FAMILY="13x" ;;
+    12.*) CUDA_FAMILY="12x" ;;
+    11.*) CUDA_FAMILY="11x" ;;
+    10.2) CUDA_FAMILY="102" ;;
+    *) CUDA_FAMILY="unknown" ;;
+esac
+
+if [[ "$CUDA_AVAILABLE" != "True" ]]; then
+    echo "❌ PyTorch cannot access a CUDA GPU in the detected environment."
+    echo "   Check that you selected a compatible NVIDIA GPU/Vast.ai ComfyUI template."
+    exit 1
+fi
+
+if [[ "$CUDA_FAMILY" == "unknown" ]]; then
+    echo "❌ Unsupported/unknown PyTorch CUDA build: $TORCH_CUDA_VERSION"
+    echo "   This bootstrap currently targets CUDA 12.x and CUDA 13.x."
+    exit 1
+fi
+
+echo "✅ CUDA package family selected automatically: $CUDA_FAMILY"
+
+validate_torch_environment || exit 1
+
+
+# Read an optional pin file. Lines beginning with # are ignored.
+get_pin() {
+    local node_dir="$1"
+    [[ -f "$PIN_FILE" ]] || return 0
+    awk -F= -v key="$node_dir" '
+        /^[[:space:]]*#/ { next }
+        NF >= 2 {
+            lhs=$1; gsub(/^[[:space:]]+|[[:space:]]+$/, "", lhs)
+            rhs=$0; sub(/^[^=]*=/, "", rhs); gsub(/^[[:space:]]+|[[:space:]]+$/, "", rhs)
+            if (lhs == key) { print rhs; exit }
+        }
+    ' "$PIN_FILE"
+}
+
+clone_or_update_node() {
+    local repo="$1"
+    local node_dir="$2"
+    local pin="${3:-}"
+    local dest="$COMFY_DIR/custom_nodes/$node_dir"
+
+    if [[ "$FORCE_REINSTALL" == "true" && -e "$dest" ]]; then
+        echo "🧹 Removing managed node: $node_dir"
+        rm -rf "$dest"
+    fi
+
+    if [[ -e "$dest" && ! -d "$dest/.git" ]]; then
+        echo "❌ $node_dir exists but is not a Git repository."
+        echo "   Remove/rename that directory, then rerun the script."
+        return 1
+    fi
+
+    if [[ ! -d "$dest/.git" ]]; then
+        echo "⬇️ Cloning $node_dir..."
+        # A pinned checkout needs history/refs available for arbitrary commit
+        # or tag resolution. Use a non-shallow clone when a pin is requested.
+        if [[ -n "$pin" ]]; then
+            if ! git clone --filter=blob:none --recurse-submodules "$repo" "$dest"; then
+                echo "❌ Failed to clone pinned-capable repository $node_dir"
+                rm -rf "$dest"
+                return 1
+            fi
+        elif ! git clone --depth 1 --recurse-submodules "$repo" "$dest"; then
+            echo "❌ Failed to clone $node_dir"
+            rm -rf "$dest"
+            return 1
+        fi
+    elif [[ "$UPDATE_NODES" == "true" ]]; then
+        echo "🔄 Updating $node_dir to current remote HEAD..."
+        git -C "$dest" fetch --depth 1 origin
+        local default_ref
+        default_ref="$(git -C "$dest" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+        if [[ -n "$default_ref" ]]; then
+            git -C "$dest" reset --hard "$default_ref"
+        else
+            echo "⚠️ Could not determine origin/HEAD for $node_dir; leaving current checkout unchanged."
+        fi
+    else
+        echo "✅ $node_dir already exists; preserving current checkout."
+    fi
+
+    if [[ -n "$pin" ]]; then
+        echo "📌 Pinning $node_dir to $pin..."
+
+        # Existing shallow clones cannot reliably resolve arbitrary historical pins.
+        if [[ "$(git -C "$dest" rev-parse --is-shallow-repository 2>/dev/null || echo false)" == "true" ]]; then
+            echo "   -> Repository is shallow; fetching full history for pin resolution..."
+            git -C "$dest" fetch --unshallow origin
+        fi
+
+        git -C "$dest" fetch --tags origin
+        if ! git -C "$dest" rev-parse --verify --quiet "$pin^{commit}" >/dev/null; then
+            git -C "$dest" fetch origin "$pin"
+        fi
+        git -C "$dest" checkout --detach "$pin"
+        git -C "$dest" submodule update --init --recursive
+    fi
+
+    return 0
+}
+
+install_node_dependencies() {
+    local node_dir="$1"
+    local dest="$COMFY_DIR/custom_nodes/$node_dir"
+
+    echo "🔧 Installing dependencies for $node_dir..."
+
+    case "$node_dir" in
+        ComfyUI-Frame-Interpolation)
+            # The upstream install.py currently maps CUDA only through 12.x.
+            # On CUDA 13, use the project's requirements-no-cupy.txt and install
+            # CuPy's official CUDA-13 wheel explicitly. Current upstream runtime
+            # code also dynamically discovers CUDA_HOME for its CuPy RawModule.
+            # This avoids using the main-branch installer path that still lacks
+            # CUDA-13 package mapping.
+            if [[ "$FRAME_INTERPOLATION_CUDA13" == "disable" && "$CUDA_FAMILY" == "13x" ]]; then
+                echo "⚠️ FRAME_INTERPOLATION_CUDA13=disable; skipping Frame Interpolation on CUDA 13."
+                return 1
+            fi
+
+            echo "   -> Installing Frame Interpolation common requirements..."
+            uv_pip install --no-cache -r "$dest/requirements-no-cupy.txt"
+
+            echo "   -> Selecting CuPy package automatically for CUDA family: $CUDA_FAMILY"
+            uv_pip uninstall -y \
+                cupy cupy-wheel cupy-cuda102 cupy-cuda110 cupy-cuda111 cupy-cuda11x cupy-cuda12x cupy-cuda13x \
+                >/dev/null 2>&1 || true
+
+            case "$CUDA_FAMILY" in
+                13x)
+                    uv_pip install --no-cache "cupy-cuda13x"
+                    ;;
+                12x)
+                    uv_pip install --no-cache "cupy-cuda12x"
+                    ;;
+                11x)
+                    uv_pip install --no-cache "cupy-cuda11x"
+                    ;;
+                102)
+                    uv_pip install --no-cache "cupy-cuda102"
+                    ;;
+                *)
+                    echo "❌ No supported CuPy mapping for CUDA family $CUDA_FAMILY"
+                    return 1
+                    ;;
+            esac
+
+            # The project uses CUDA_HOME while compiling its RawModule kernels.
+            # Prefer PyTorch's bundled CUDA component directory when present.
+            TORCH_CUDA_LIB="$($PYTHON_CMD -c 'from pathlib import Path; import torch; p=Path(torch.__file__).parent / "lib"; print(p if (p / "libnvrtc-builtins.so").exists() or any(p.glob("*nvrtc-builtins*")) else "")' 2>/dev/null || true)"
+            if [[ -n "$TORCH_CUDA_LIB" ]]; then
+                export CUDA_HOME="$TORCH_CUDA_LIB"
+                export CUDA_PATH="$TORCH_CUDA_LIB"
+                echo "   -> CUDA_HOME set to PyTorch CUDA component directory: $CUDA_HOME"
+            elif [[ -d /usr/local/cuda ]]; then
+                export CUDA_HOME=/usr/local/cuda
+                export CUDA_PATH=/usr/local/cuda
+                echo "   -> CUDA_HOME set to: $CUDA_HOME"
+            fi
+            ;;
+
+        ComfyUI-Impact-Pack)
+            # Impact Pack has its own installer and can also provision SAM/ONNX
+            # model assets. INSTALL_IMPACT_MODELS=false creates its documented
+            # skip sentinel only for this run, then removes it.
+            if [[ "$INSTALL_IMPACT_MODELS" == "true" ]]; then
+                (cd "$dest" && \
+                    COMFYUI_PATH="$COMFY_DIR" \
+                    COMFYUI_MODEL_PATH="$COMFY_DIR/models" \
+                    "$PYTHON_CMD" install.py)
+            else
+                touch "$COMFY_DIR/custom_nodes/skip_download_model"
+                (cd "$dest" && \
+                    COMFYUI_PATH="$COMFY_DIR" \
+                    COMFYUI_MODEL_PATH="$COMFY_DIR/models" \
+                    "$PYTHON_CMD" install.py)
+                rm -f "$COMFY_DIR/custom_nodes/skip_download_model"
+            fi
+            ;;
+
+        ComfyUI-Pixaroma)
+            # Pixaroma declares imageio-ffmpeg in pyproject.toml.
+            uv_pip install --no-cache -e "$dest"
+            ;;
+
+        *)
+            if [[ -f "$dest/requirements.txt" ]]; then
+                uv_pip install --no-cache -r "$dest/requirements.txt"
+            elif [[ -f "$dest/pyproject.toml" ]]; then
+                # Some ComfyUI extensions use pyproject.toml without a separate
+                # requirements.txt. Install them editable so declared deps land
+                # in the ComfyUI venv.
+                uv_pip install --no-cache -e "$dest"
+            else
+                echo "   ℹ️ No requirements.txt/pyproject.toml found; no pip install needed."
+            fi
+            ;;
+    esac
+}
+
+verify_node_install() {
+    local node_dir="$1"
+
+    case "$node_dir" in
+        ComfyUI-Frame-Interpolation)
+            # Verify both the common runtime dependencies and the CUDA-specific
+            # CuPy package family selected above.
+            if ! "$PYTHON_CMD" -c 'import cupy, cv2, kornia' >/dev/null 2>&1; then
+                echo "❌ Frame Interpolation dependency verification failed (cupy/cv2/kornia)."
+                return 1
+            fi
+
+            CUPY_CUDA_VERSION="$($PYTHON_CMD -c 'import cupy; print(cupy.cuda.runtime.runtimeGetVersion())' 2>/dev/null || echo unknown)"
+            echo "   -> CuPy CUDA runtime API version: $CUPY_CUDA_VERSION"
+
+            case "$CUDA_FAMILY" in
+                13x)
+                    if ! "$PYTHON_CMD" -c 'import cupy; assert cupy.cuda.runtime.runtimeGetVersion() >= 13000' >/dev/null 2>&1; then
+                        echo "❌ CUDA 13 was detected but CuPy is not a CUDA-13 build."
+                        return 1
+                    fi
+                    ;;
+                12x)
+                    if ! "$PYTHON_CMD" -c 'import cupy; assert 12000 <= cupy.cuda.runtime.runtimeGetVersion() < 13000' >/dev/null 2>&1; then
+                        echo "❌ CUDA 12 was detected but CuPy is not a CUDA-12 build."
+                        return 1
+                    fi
+                    ;;
+            esac
+            ;;
+
+        ComfyUI-Impact-Pack)
+            if ! "$PYTHON_CMD" -c 'import impact.config' >/dev/null 2>&1; then
+                echo "❌ Impact Pack import verification failed."
+                return 1
+            fi
+            if [[ "$INSTALL_IMPACT_MODELS" == "true" && ! -f "$COMFY_DIR/models/sams/sam_vit_b_01ec64.pth" ]]; then
+                echo "❌ Impact Pack SAM model was not found after installation."
+                echo "   Expected: $COMFY_DIR/models/sams/sam_vit_b_01ec64.pth"
+                return 1
+            fi
+            ;;
+
+        ComfyUI-Pixaroma)
+            if ! "$PYTHON_CMD" -c 'import imageio_ffmpeg' >/dev/null 2>&1; then
+                echo "❌ Pixaroma dependency verification failed (imageio-ffmpeg)."
+                return 1
+            fi
+            ;;
+    esac
+
+    return 0
+}
+
+# --------------------------- Install custom nodes ----------------------------
+echo ""
+echo "================ Custom Nodes ================"
+for repo in "${REPOS[@]}"; do
+    node_dir="$(basename "$repo" .git)"
+    pin="$(get_pin "$node_dir" || true)"
+
+    if ! clone_or_update_node "$repo" "$node_dir" "$pin"; then
+        append_failure "node clone/update: $node_dir"
+        continue
+    fi
+
+    if ! install_node_dependencies "$node_dir"; then
+        echo "❌ Dependency installation failed for $node_dir"
+        append_failure "node dependencies: $node_dir"
+        continue
+    fi
+
+    if ! verify_node_install "$node_dir"; then
+        append_failure "node verification: $node_dir"
+        continue
+    fi
+
+    commit="$(git -C "$COMFY_DIR/custom_nodes/$node_dir" rev-parse HEAD 2>/dev/null || echo unknown)"
+    echo "   ✅ $node_dir @ $commit"
+done
+
+# -------------------------- Python environment audit --------------------------
+echo ""
+echo "================ Python Environment Audit ================"
+if ! uv_pip check; then
+    append_failure "pip dependency consistency check"
+else
+    echo "✅ pip check passed."
+fi
+
+PIP_FREEZE_FILE="${WORKSPACE}/comfyui-seed-hunter-pip-freeze.txt"
+if uv_pip freeze > "$PIP_FREEZE_FILE"; then
+    echo "✅ pip freeze saved to: $PIP_FREEZE_FILE"
+else
+    append_failure "pip freeze"
+fi
+
+if [[ "$CLEAN_PIP_CACHE" == "true" ]]; then
+    "$UV_CMD" cache clean >/dev/null 2>&1 || true
+    echo "✅ uv cache cleaned."
+fi
+
+validate_torch_environment || append_failure "final PyTorch environment validation"
+
+# ---------------------------- Model directories ------------------------------
+echo ""
+echo "================ Model Directories ================"
+mkdir -p \
+    "$COMFY_DIR/models/checkpoints" \
+    "$COMFY_DIR/models/diffusion_models" \
+    "$COMFY_DIR/models/latent_upscale_models" \
+    "$COMFY_DIR/models/loras" \
+    "$COMFY_DIR/models/vae" \
+    "$COMFY_DIR/models/vae_approx" \
+    "$COMFY_DIR/user/default/workflows"
+
+# ------------------------- Download helpers ----------------------------------
+# Fetch the primary SHA-256 recorded by Civitai for a model version.
+# This avoids hard-coding a Civitai hash that may be wrong for a particular
+# version ID, while keeping the token out of the URL.
+civitai_sha256() {
+    local version_id="$1"
+    local metadata
+    metadata="$(curl -fsSL \
+        --retry 3 --retry-all-errors --connect-timeout 20 --max-time 60 \
+        -H "Authorization: Bearer $API_TOKEN" \
+        "https://civitai.com/api/v1/model-versions/mini/$version_id")"
+
+    jq -er '.hashes.SHA256 // empty' <<<"$metadata"
+}
+
+civitai_size() {
+    local version_id="$1"
+    curl -fsSL \
+        --retry 3 --retry-all-errors --connect-timeout 20 --max-time 60 \
+        -H "Authorization: Bearer $API_TOKEN" \
+        "https://civitai.com/api/v1/model-versions/mini/$version_id" | \
+        jq -er '.size // empty'
+}
+
+download_file() {
+    local dest_dir="$1"
+    local filename="$2"
+    local url="$3"
+    local min_bytes="$4"
+    local expected_sha256="${5:-}"
+    local auth_mode="${6:-none}"
+
+    local dest="$dest_dir/$filename"
+    local part="$dest_dir/.${filename}.part"
+    local actual_size
+
+    mkdir -p "$dest_dir"
+
+    if [[ -f "$dest" ]]; then
+        echo "🔎 Checking existing $filename..."
+        if verify_file "$dest" "$min_bytes" "$expected_sha256"; then
+            actual_size="$(file_size "$dest")"
+            echo "✅ $filename already verified ($(human_size "$actual_size")); skipping."
+            return 0
+        fi
+
+        echo "⚠️ Existing $filename failed validation; replacing it."
+        rm -f "$dest"
+    fi
+
+    if [[ -f "$part" ]]; then
+        echo "↻ Resuming $filename from $(human_size "$(file_size "$part")")..."
+    else
+        echo "⬇️ Downloading $filename..."
+    fi
+
+    local -a aria_args=(
+        --allow-overwrite=true
+        --auto-file-renaming=false
+        --file-allocation=none
+        --continue=true
+        --max-tries=3
+        --retry-wait=3
+        --split="$ARIA2_SPLIT"
+        --max-connection-per-server="$ARIA2_CONNECTIONS"
+        --min-split-size=20M
+        --connect-timeout=30
+        --timeout=60
+        --summary-interval=10
+        --console-log-level=warn
+        --dir="$dest_dir"
+        --out=".${filename}.part"
+    )
+
+    if [[ "$auth_mode" == "civitai" ]]; then
+        aria_args+=(--header="Authorization: Bearer $API_TOKEN")
+    fi
+
+    if ! aria2c "${aria_args[@]}" "$url"; then
+        echo "⚠️ aria2c failed for $filename; falling back to wget..."
+        rm -f "${part}.aria2"
+
+        if [[ "$auth_mode" == "civitai" ]]; then
+            local -a wget_args=(
+                --no-verbose
+                --show-progress
+                --continue
+                --tries=3
+                --timeout=60
+                --header="Authorization: Bearer $API_TOKEN"
+                -O "$part"
+            )
+        else
+            local -a wget_args=(
+                --no-verbose
+                --show-progress
+                --continue
+                --tries=3
+                --timeout=60
+                -O "$part"
+            )
+        fi
+
+        if ! wget "${wget_args[@]}" "$url"; then
+            rm -f "$part" "${part}.aria2"
+            echo "❌ Failed to download $filename"
+            return 1
+        fi
+    fi
+
+    if ! verify_file "$part" "$min_bytes" "$expected_sha256"; then
+        echo "❌ Downloaded $filename failed validation."
+        rm -f "$part" "${part}.aria2"
+        return 1
+    fi
+
+    actual_size="$(file_size "$part")"
+    mv -f "$part" "$dest"
+    rm -f "${part}.aria2"
+    echo "✅ Downloaded and verified $filename ($(human_size "$actual_size"))"
+}
+
+# ----------------------------- Civitai assets --------------------------------
+echo ""
+echo "================ Civitai Assets ================"
+
+CIVITAI_MODEL_VERSION_ID="${CIVITAI_MODEL_VERSION_ID:-3314675}"
+CIVITAI_WORKFLOW_VERSION_ID="${CIVITAI_WORKFLOW_VERSION_ID:-3337930}"
+
+CIVITAI_MODEL_SIZE_BYTES="$(civitai_size "$CIVITAI_MODEL_VERSION_ID" 2>/dev/null || true)"
+CIVITAI_WORKFLOW_SIZE_BYTES="$(civitai_size "$CIVITAI_WORKFLOW_VERSION_ID" 2>/dev/null || true)"
+if [[ -n "$CIVITAI_MODEL_SIZE_BYTES" ]]; then
+    echo "📦 Civitai checkpoint size: $(human_size "$CIVITAI_MODEL_SIZE_BYTES")"
+fi
+if [[ -n "$CIVITAI_WORKFLOW_SIZE_BYTES" ]]; then
+    echo "📄 Civitai workflow size: $(human_size "$CIVITAI_WORKFLOW_SIZE_BYTES")"
+fi
+
+# Check disk immediately before the expensive model/workflow downloads.
+check_disk_space || exit 1
+
+# Verify that the version exists and obtain the server-recorded SHA-256.
+CIVITAI_MODEL_SHA256="$(civitai_sha256 "$CIVITAI_MODEL_VERSION_ID")" || {
+    echo "❌ Could not obtain the Civitai SHA-256 for version $CIVITAI_MODEL_VERSION_ID."
+    append_failure "Civitai model metadata: $CIVITAI_MODEL_VERSION_ID"
+    CIVITAI_MODEL_SHA256=""
+}
+
+if [[ -n "$CIVITAI_MODEL_SHA256" ]]; then
+    download_file \
+        "$COMFY_DIR/models/checkpoints" \
+        "dasiwa_minimax_h3.safetensors" \
+        "https://civitai.com/api/download/models/$CIVITAI_MODEL_VERSION_ID" \
+        5000000000 \
+        "$CIVITAI_MODEL_SHA256" \
+        civitai || append_failure "Civitai checkpoint download"
+else
+    echo "⏭️ Skipping checkpoint download because its expected hash could not be established."
+fi
+
+if [[ -f "$COMFY_DIR/models/checkpoints/dasiwa_minimax_h3.safetensors" ]]; then
+    ln -sfn \
+        "$COMFY_DIR/models/checkpoints/dasiwa_minimax_h3.safetensors" \
+        "$COMFY_DIR/models/diffusion_models/dasiwa_minimax_h3.safetensors"
+    echo "✅ Diffusion-model symlink created."
+fi
+
+# Workflow JSON: validate both download integrity and JSON syntax.
+CIVITAI_WORKFLOW_SHA256="$(civitai_sha256 "$CIVITAI_WORKFLOW_VERSION_ID")" || {
+    echo "❌ Could not obtain the Civitai SHA-256 for workflow version $CIVITAI_WORKFLOW_VERSION_ID."
+    append_failure "Civitai workflow metadata: $CIVITAI_WORKFLOW_VERSION_ID"
+    CIVITAI_WORKFLOW_SHA256=""
+}
+
+if [[ -n "$CIVITAI_WORKFLOW_SHA256" ]]; then
+    if ! download_file \
+        "$COMFY_DIR/user/default/workflows" \
+        "Minimax_Seed_Hunter.json" \
+        "https://civitai.com/api/download/models/$CIVITAI_WORKFLOW_VERSION_ID" \
+        1024 \
+        "$CIVITAI_WORKFLOW_SHA256" \
+        civitai; then
+        append_failure "Civitai workflow download"
+    fi
+else
+    echo "⏭️ Skipping workflow download because its expected hash could not be established."
+fi
+
+WORKFLOW_FILE="${COMFY_DIR}/user/default/workflows/Minimax_Seed_Hunter.json"
+if [[ -f "$WORKFLOW_FILE" ]]; then
+    if jq empty "$WORKFLOW_FILE" >/dev/null 2>&1; then
+        echo "✅ Workflow JSON syntax validated."
+    else
+        echo "❌ Workflow file is not valid JSON."
+        rm -f "$WORKFLOW_FILE"
+        append_failure "workflow JSON validation"
+    fi
+fi
+
+# --------------------------- Hugging Face assets -----------------------------
+echo ""
+echo "================ Hugging Face Assets ================"
+
+download_file \
+    "$COMFY_DIR/models/latent_upscale_models" \
+    "minimax_h3_latent_upscaler_3d_conv_v1_fp16.safetensors" \
+    "https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler/resolve/main/minimax_h3_latent_upscaler_3d_conv_v1/minimax_h3_latent_upscaler_3d_conv_v1_fp16.safetensors" \
+    650000000 \
+    "043e5a48e161610ef6c3ea974645220354d06fa618abca15f76d084812eb55c2" \
+    none || append_failure "latent upscaler"
+
+download_file \
+    "$COMFY_DIR/models/loras" \
+    "minimax_h3_fl2v_turbo_silver_dareties_comfy_pruned_v1.safetensors" \
+    "https://huggingface.co/silveroxides/MiniMax-H3_tests/resolve/main/minimax_h3_fl2v_turbo_silver_dareties_comfy_pruned_v1.safetensors" \
+    725000000 \
+    "9aab6353ce76f0a1c6a6fbbeaa1a4c60deced365e328bc14ddb0b7b9f0849b48" \
+    none || append_failure "Turbo LoRA"
+
+download_file \
+    "$COMFY_DIR/models/vae" \
+    "minimax_h3_video_vae_int8_convrot.safetensors" \
+    "https://huggingface.co/Kijai/MiniMax-H3-experimental/resolve/main/minimax_h3_video_vae_int8_convrot.safetensors" \
+    3000000000 \
+    "9bb2d96f218c76babd85e0611b85ca8fb330a90546c01a0005e8a58a59593410" \
+    none || append_failure "MiniMax H3 video VAE"
+
+download_file \
+    "$COMFY_DIR/models/vae_approx" \
+    "taeh3.safetensors" \
+    "https://huggingface.co/Kijai/MiniMax-H3-TAE/resolve/main/vae_approx/taeh3.safetensors" \
+    9000000 \
+    "f0f60fa072089997f817402098c2fd90777cb2660dd79cf5df42fc1e3e08e527" \
+    none || append_failure "TAE H3 approximate VAE"
+
+# ------------------------------- Manifest ------------------------------------
+echo ""
+echo "================ Manifest ================"
+{
+    echo "timestamp=$(date -Iseconds)"
+    echo "comfy_dir=$COMFY_DIR"
+    echo "python=$PYTHON_CMD"
+    echo "torch_version=$TORCH_VERSION"
+    echo "torch_cuda_build=$TORCH_CUDA_VERSION"
+    echo "cuda_family=$CUDA_FAMILY"
+    echo "cuda_available=$CUDA_AVAILABLE"
+    echo "gpu=$GPU_NAME"
+    echo "driver_cuda_compatibility=$DRIVER_CUDA_VERSION"
+    echo "pip_constraints=$PIP_CONSTRAINT_FILE"
+    if [[ -f "$PIP_FREEZE_FILE" ]]; then
+        echo "pip_freeze_sha256=$(sha256sum "$PIP_FREEZE_FILE" | awk '{print $1}')"
+    fi
+    if [[ -f "$PIN_FILE" ]]; then
+        echo "pin_file_sha256=$(sha256sum "$PIN_FILE" | awk '{print $1}')"
+    else
+        echo "pin_file_sha256=none"
+    fi
+    echo ""
+    echo "[custom_nodes]"
+    for node_dir in "${MANAGED_NODE_DIRS[@]}"; do
+        if [[ -d "$COMFY_DIR/custom_nodes/$node_dir/.git" ]]; then
+            echo "$node_dir=$(git -C "$COMFY_DIR/custom_nodes/$node_dir" rev-parse HEAD 2>/dev/null || echo unknown)"
+        fi
+    done
+    echo ""
+    echo "[assets_sha256]"
+    for f in \
+        "$COMFY_DIR/models/checkpoints/dasiwa_minimax_h3.safetensors" \
+        "$COMFY_DIR/models/latent_upscale_models/minimax_h3_latent_upscaler_3d_conv_v1_fp16.safetensors" \
+        "$COMFY_DIR/models/loras/minimax_h3_fl2v_turbo_silver_dareties_comfy_pruned_v1.safetensors" \
+        "$COMFY_DIR/models/vae/minimax_h3_video_vae_int8_convrot.safetensors" \
+        "$COMFY_DIR/models/vae_approx/taeh3.safetensors" \
+        "$WORKFLOW_FILE"; do
+        if [[ -f "$f" ]]; then
+            echo "$(basename "$f")=$(sha256sum "$f" | awk '{print $1}')"
+        fi
+    done
+} > "$MANIFEST_FILE"
+
+echo "✅ Manifest saved to: $MANIFEST_FILE"
+
+# ------------------------------ Restart --------------------------------------
+restart_comfy() {
+    if ! command -v supervisorctl >/dev/null 2>&1; then
+        echo "ℹ️ supervisorctl is unavailable; Vast will start/reload ComfyUI through its normal service lifecycle."
+        return 10
+    fi
+
+    echo "🔄 Restarting Vast.ai ComfyUI service via Supervisor..."
+    if supervisorctl restart comfyui; then
+        echo "✅ Supervisor restarted the ComfyUI service."
+        return 0
+    fi
+
+    echo "⚠️ supervisorctl restart failed; attempting start in case the service is stopped."
+    if supervisorctl start comfyui; then
+        echo "✅ Supervisor started the ComfyUI service."
+        return 0
+    fi
+
+    echo "ℹ️ ComfyUI service is not restartable from the current provisioning phase; leaving it to Vast's normal lifecycle."
+    return 10
+}
+
+# ------------------------------ Final status ---------------------------------
+echo ""
+echo "==============================================================="
+if ((${#FAILED_ITEMS[@]})); then
+    echo "⚠️ Setup finished with failures. ComfyUI will NOT be restarted."
+    echo ""
+    printf '  - %s\n' "${FAILED_ITEMS[@]}"
+    echo ""
+    echo "Log:      $LOG_FILE"
+    echo "Manifest: $MANIFEST_FILE"
+    echo "==============================================================="
+    exit 1
+fi
+
+if [[ "$RESTART_COMFY" == "false" ]]; then
+    echo "ℹ️ RESTART_COMFY=false; leaving the currently running ComfyUI process alone."
+elif [[ "$RESTART_COMFY" == "true" ]]; then
+    unset rc
+    restart_comfy || rc=$?
+    if [[ "${rc:-0}" != "0" ]]; then
+        if [[ "${rc:-0}" == "10" ]]; then
+            echo "ℹ️ Automatic restart is unavailable; Supervisor is not controllable from this shell."
+        else
+            echo "❌ Setup files are installed, but ComfyUI restart/readiness failed."
+            echo "   Log: $COMFY_LOG"
+            exit 1
+        fi
+    fi
+else
+    # auto: attempt a Supervisor restart, but never mark provisioning failed
+    # merely because the service is not controllable during this boot phase.
+    restart_comfy || rc=$?
+    if [[ "${rc:-0}" == "10" ]]; then
+        echo "ℹ️ Automatic ComfyUI restart was skipped; Vast's Supervisor lifecycle will load the installed nodes."
+    elif [[ "${rc:-0}" != "0" ]]; then
+        echo "⚠️ Automatic ComfyUI restart failed; setup files are installed."
+        echo "   Log: $COMFY_LOG"
+    fi
+fi
+
+# Confirm we still have sensible disk headroom after downloads and installs.
+if ! check_disk_space; then
+    echo "⚠️ Setup succeeded but disk headroom is below the configured reserve."
+fi
+
+cd "$ORIGINAL_DIR"
+
+echo ""
+echo "🎉 Setup complete."
+echo "   ComfyUI:  $COMFY_DIR"
+echo "   Workflow: $WORKFLOW_FILE"
+echo "   Setup log: $LOG_FILE"
+echo "   Manifest:  $MANIFEST_FILE"
+echo "   Comfy log: $COMFY_LOG"
+echo "==============================================================="
