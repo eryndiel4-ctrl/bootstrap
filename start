@@ -1000,6 +1000,13 @@ fi
 # --------------------------- Hugging Face assets -----------------------------
 echo ""
 echo "================ Hugging Face Assets ================"
+download_file \
+    "$COMFY_DIR/models/text_encoders" \
+    "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors" \
+    "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors" \
+    15000000000 \
+    "35a88d51044231fe332301d7a62aa81e3f2cba62febeb446e2c1e3e0ef76f2c6" \
+    none || append_failure "Qwen3-VL H3 text encoder"
 
 download_file \
     "$COMFY_DIR/models/latent_upscale_models" \
