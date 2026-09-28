@@ -574,7 +574,7 @@ parallel_clone_or_update() {
 }
 
 _for_all_git() {
-    while ((${#GIT_PIDS[@])); do
+    while ((${#GIT_PIDS[@]})); do
         local pid="${GIT_PIDS[0]}"
         local label="${GIT_LABELS[0]}"
 
