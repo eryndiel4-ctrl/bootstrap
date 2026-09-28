@@ -321,6 +321,8 @@ echo "✅ Hugging Face Xet is available."
 
 export HF_HOME="${HF_HOME:-/workspace/.cache/huggingface}"
 export HF_XET_CACHE="${HF_XET_CACHE:-/workspace/.cache/huggingface/xet}"
+export UV_CACHE_DIR="${UV_CACHE_DIR:-/workspace/.cache/uv}"
+export MAX_JOBS="${MAX_JOBS:-8}"
 
 # Vast's official image owns the PyTorch/CUDA stack. Protect the image-baked
 # torch family from custom-node installers by constraining already-installed
