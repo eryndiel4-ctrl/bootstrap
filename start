@@ -499,7 +499,7 @@ clone_or_update_node() {
         # A pinned checkout needs history/refs available for arbitrary commit
         # or tag resolution. Use a non-shallow clone when a pin is requested.
         if [[ -n "$pin" ]]; then
-            if ! git clone --filter=blob:none --recurse-submodules "$repo" "$dest"; then
+            if ! git clone --depth 1 --shallow-submodules --recurse-submodules "$repo" "$dest"; then
                 echo "❌ Failed to clone pinned-capable repository $node_dir"
                 rm -rf "$dest"
                 return 1
