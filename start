@@ -1050,7 +1050,19 @@ download_hf_xet() {
         "$PYTHON_CMD" - "$repo_id" "$remote_filename" "$xet_dir" "$revision" <<'PY'
 import os
 import sys
+
 from huggingface_hub import hf_hub_download
+from tqdm.auto import tqdm
+
+
+class AlwaysProgress(tqdm):
+    """Force tqdm to display even when stderr is not attached to a TTY."""
+    def __init__(self, *args, **kwargs):
+        kwargs["disable"] = False
+        kwargs.setdefault("dynamic_ncols", True)
+        kwargs.setdefault("mininterval", 0.5)
+        super().__init__(*args, **kwargs)
+
 
 repo_id = sys.argv[1]
 filename = sys.argv[2]
@@ -1067,8 +1079,12 @@ path = hf_hub_download(
     revision=revision,
     token=token,
     local_dir=local_dir,
+    tqdm_class=AlwaysProgress,
 )
 
+# IMPORTANT:
+# This is stdout, which is captured by the Bash command substitution.
+# The tqdm progress bar goes to stderr and remains visible.
 print(path)
 PY
     )" || {
