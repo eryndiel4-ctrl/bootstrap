@@ -319,6 +319,9 @@ fi
 
 echo "✅ Hugging Face Xet is available."
 
+export HF_HOME="${HF_HOME:-/workspace/.cache/huggingface}"
+export HF_XET_CACHE="${HF_XET_CACHE:-/workspace/.cache/huggingface/xet}"
+
 # Vast's official image owns the PyTorch/CUDA stack. Protect the image-baked
 # torch family from custom-node installers by constraining already-installed
 # core packages instead of replacing them with arbitrary resolver choices.
@@ -1008,6 +1011,7 @@ wait_for_all_downloads() {
 }
 
 # ------------------------- Hugging Face Xet download --------------------------
+
 download_hf_xet() {
     local dest_dir="$1"
     local remote_filename="$2"
