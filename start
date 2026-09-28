@@ -1113,13 +1113,15 @@ parallel_hf_xet_download \
     "Eryndiel/model" \
     "main"
 
-parallel_download \
+parallel_hf_xet_download \
     "Qwen3-VL H3 text encoder" \
     "$COMFY_DIR/models/text_encoders" \
+    "text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors" \
     "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors" \
-    "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors" \
     15000000000 \
-    "35a88d51044231fe332301d7a62aa81e3f2cba62febeb446e2c1e3e0ef76f2c6" 
+    "35a88d51044231fe332301d7a62aa81e3f2cba62febeb446e2c1e3e0ef76f2c6" \
+    "Comfy-Org/MiniMax-H3" \
+    "main"
 
 parallel_download \
     "latent upscaler" \
@@ -1203,10 +1205,11 @@ echo "================ Manifest ================"
     echo "[assets_sha256]"
     for f in \
        "$COMFY_DIR/models/checkpoints/DasiwaMinimaxH3_dasiwaHybridTurboV2_int8.safetensors" \
+       "$COMFY_DIR/models/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors" \
        "$COMFY_DIR/models/latent_upscale_models/minimax_h3_latent_upscaler_3d_conv_v1_fp16.safetensors" \
        "$COMFY_DIR/models/loras/minimax_h3_fl2v_turbo_silver_dareties_comfy_pruned_v1.safetensors" \
        "$COMFY_DIR/models/vae/minimax_h3_video_vae_int8_convrot.safetensors" \
-    "$COMFY_DIR/models/vae/minimax_h3_audio_vae_fp32.safetensors" \
+       "$COMFY_DIR/models/vae/minimax_h3_audio_vae_fp32.safetensors" \
        "$COMFY_DIR/models/vae_approx/taeh3.safetensors"; do
     if [[ -f "$f" ]]; then
         echo "$(basename "$f")=$(sha256sum "$f" | awk '{print $1}')"
