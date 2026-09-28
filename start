@@ -913,21 +913,20 @@ download_file() {
     fi
 
     local -a aria_args=(
-        --allow-overwrite=true
-        --auto-file-renaming=false
-        --file-allocation=none
-        --continue=true
-        --max-tries=3
-        --retry-=3
-        --split="$ARIA2_SPLIT"
-        --max-connection-per-server="$ARIA2_CONNECTIONS"
-        --min-split-size=20M
-        --connect-timeout=30
-        --timeout=60
-        --summary-interval=10
-        --console-log-level=warn
-        --dir="$dest_dir"
-        --out=".${filename}.part"
+    --allow-overwrite=true
+    --auto-file-renaming=false
+    --file-allocation=none
+    --continue=true
+    --max-tries=3
+    --split="$ARIA2_SPLIT"
+    --max-connection-per-server="$ARIA2_CONNECTIONS"
+    --min-split-size=20M
+    --connect-timeout=30
+    --timeout=60
+    --summary-interval=10
+    --console-log-level=warn
+    --dir="$dest_dir"
+    --out=".${filename}.part"
     )
 
     if ! aria2c "${aria_args[@]}" "$url"; then
