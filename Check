@@ -199,7 +199,7 @@ PY
 eval "$(pypy="$cpu_json" "$PYTHON" -c '
 import json, os, shlex
 d = json.loads(os.environ["pypy"])
-print(f"CPU_GFLOPS={shlex.quote(str(d.get("gflops", 0)))}")
+print(f"CPU_GFLOPS={shlex.quote(str(d.get('gflops', 0)))}")
 print(f"CPU_BENCH_SECONDS={shlex.quote(str(d.get("elapsed_s", 0)))}")
 ')"
 
@@ -428,7 +428,7 @@ if command -v git >/dev/null 2>&1 && [[ -x "$PYTHON" ]]; then
         fi
     else
         log "SAM2 GitHub clone time: ${SAM2_SECONDS}s"
-        if awk -v s="$SAM2_SECONDS" -v min="$MIN_SAM2_SECONDS" 'BEGIN {exit !(s <= min)}' then
+        if awk -v s="$SAM2_SECONDS" -v min="$MIN_SAM2_SECONDS" 'BEGIN {exit !(s <= min)}'; then
             pass "SAM2 GitHub clone threshold passed (${SAM2_SECONDS}s <= ${MIN_SAM2_SECONDS}s)."
         else
             fail "SAM2 GitHub clone threshold failed (${SAM2_SECONDS}s > ${MIN_SAM2_SECONDS}s)."
@@ -514,7 +514,7 @@ log "SAM2 Git clone:    ${SAM2_SECONDS:-not measured} s"
 log "SAM2 CUDA build:   ${SAM2_BUILD_SECONDS:-not measured} s"
 log ""
 
-if [[ -n "$HF_MBPS" ]] && awk "BEGIN {print ($HF_MBPS > 0)}" >/dev/null; then
+if [[ -n "$HF_MBPS" ]] && awk "BEGIN {exit !($HF_MBPS > 0)}"; then
     estimated_min="$(awk -v b="$TOTAL_H3_ASSET_BYTES" -v mbps="$HF_MBPS" 'BEGIN {printf "%.1f", b/mbps/1e6/60}')"
     log "Rough single-stream estimate for the ~40 GB H3 asset bundle: ${estimated_min} minutes at ${HF_MBPS} MB/s."
     log "Actual bootstrap time can be lower/higher because it uses parallel downloads and different hosts."
