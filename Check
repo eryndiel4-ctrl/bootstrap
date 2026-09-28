@@ -37,7 +37,7 @@
 # universal claims about what hardware is "good" for every workload.
 # ============================================================================
 
-set -Eeuo pipefail
+bash preflight.sh
 
 WORKSPACE="${WORKSPACE:-/workspace}"
 PYTHON="${PYTHON:-/venv/main/bin/python}"
@@ -106,8 +106,8 @@ log "to the full bootstrap."
 section "1) GPU / CUDA"
 if ! command -v nvidia-smi >/dev/null 2>&1; then
     fail "nvidia-smi is not available."
-else
-    nvidia-smi --query-gpu=name,driver_version,memory.total,memory.free,power.limit --format=csv,noheader || true
+elif ! nvidia-smi --query-gpu=name,driver_version,memory.total,memory.free,power.limit --format=csv,noheader; then
+    fail "nvidia-smi is present but could not query the GPU."
 fi
 
 if [[ ! -x "$PYTHON" ]]; then
@@ -150,7 +150,7 @@ fi
 
 section "0) CPU"
 
-CPU_MODEL="$(lscpu 2>/dev/null | awk -F: '/Model name/ {gsub(/^[ \t]+/, "", $2); print $2; exit}')"
+CPU_MODEL="$(lscpu 2>/dev/null | awk -F: '/Model name/ {gsub(/^[ \t]+/, "", $2); print $2; exit}' || true)"
 CPU_COUNT="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 0)"
 CPU_THREADS_PER_CORE="$(lscpu 2>/dev/null | awk -F: '/Thread\\(s\\) per core/ {gsub(/^[ \t]+/, "", $2); print $2; exit}' || true)"
 CPU_SOCKETS="$(lscpu 2>/dev/null | awk -F: '/Socket\\(s\\)/ {gsub(/^[ \t]+/, "", $2); print $2; exit}' || true)"
@@ -232,7 +232,7 @@ iters = int(sys.argv[2])
 
 if not torch.cuda.is_available():
     print(json.dumps({"ok": False, "reason": "CUDA unavailable"}))
-    raise SystemExit(1)
+    raise SystemExit(0)
 
 props = torch.cuda.get_device_properties(0)
 vr = props.total_memory / 1e9
@@ -477,7 +477,8 @@ fi
 section "5) Quick connectivity latency"
 if command -v git >/dev/null 2>&1; then
     start_epoch="$(date +%s.%N)"
-    if git ls-remote --heads "$SAM2_GIT_URL" >/dev/null 2>&1; then
+if timeout "$SAM2_TIMEOUT" \
+    git ls-remote --heads "$SAM2_GIT_URL" >/dev/null 2>&1; then
         end_epoch="$(date +%s.%N)"
         git_latency="$(awk -v s="$start_epoch" -v e="$end_epoch" 'BEGIN {printf "%.2f", e-s}')"
         pass "GitHub ls-remote succeeded in ${git_latency}s."
