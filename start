@@ -10,9 +10,6 @@
 #   Set PROVISIONING_SCRIPT to this script's public/raw URL in the Vast.ai
 #   official ComfyUI template, then create a fresh instance.
 #
-# Required environment variable:
-#   CIVITAI_TOKEN  (or CIVITAI_API_TOKEN)
-#
 # Optional environment variables:
 #   FORCE_REINSTALL=true          # Remove ONLY this script's managed nodes first
 #   UPDATE_NODES=true             # Update existing managed git nodes to latest remote
@@ -97,14 +94,6 @@ if ! mkdir "$LOCK_DIR" 2>/dev/null; then
     exit 1
 fi
 
-# --------------------------- Required credentials ---------------------------
-API_TOKEN="${CIVITAI_TOKEN:-${CIVITAI_API_TOKEN:-}}"
-if [[ -z "$API_TOKEN" ]]; then
-    echo "❌ CIVITAI_TOKEN/CIVITAI_API_TOKEN is not set."
-    echo "   Add it to the Vast.ai template / Account Environment Variables before provisioning."
-    exit 1
-fi
-
 # -------------------------- Utility functions --------------------------------
 human_size() {
     numfmt --to=iec --suffix=B "$1" 2>/dev/null || printf '%s bytes\n' "$1"
@@ -186,7 +175,7 @@ required_min_download_bytes() {
         remaining=$(( min > part_size ? min - part_size : 0 ))
         total=$(( total + remaining ))
     done <<EOF
-$COMFY_DIR/models/checkpoints/DasiwaMinimaxH3_dasiwaHybridTurboV2_int8.safetensors|${CIVITAI_MODEL_SIZE_BYTES:-5000000000}
+$COMFY_DIR/models/checkpoints/DasiwaMinimaxH3_dasiwaHybridTurboV2_int8.safetensors|19000000000
 $COMFY_DIR/models/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors|15000000000
 $COMFY_DIR/models/latent_upscale_models/minimax_h3_latent_upscaler_3d_conv_v1_fp16.safetensors|650000000
 $COMFY_DIR/models/loras/minimax_h3_fl2v_turbo_silver_dareties_comfy_pruned_v1.safetensors|725000000
@@ -317,6 +306,18 @@ fi
 uv_pip() {
     "$UV_CMD" pip "$@" --python "$PYTHON_CMD"
 }
+
+# ------------------------ Hugging Face Xet ------------------------------------
+echo "📦 Installing Hugging Face Xet downloader..."
+
+uv_pip install -U "huggingface_hub" "hf_xet"
+
+if ! "$PYTHON_CMD" -c 'import huggingface_hub, hf_xet' >/dev/null 2>&1; then
+    echo "❌ Hugging Face Xet installation failed."
+    exit 1
+fi
+
+echo "✅ Hugging Face Xet is available."
 
 # Vast's official image owns the PyTorch/CUDA stack. Protect the image-baked
 # torch family from custom-node installers by constraining already-installed
@@ -541,12 +542,12 @@ clone_or_update_node() {
 GIT_PIDS=()
 GIT_LABELS=()
 
-wait_for_git_slot() {
+_for_git_slot() {
     while ((${#GIT_PIDS[@]} >= MAX_PARALLEL_GIT_CLONES)); do
         local pid="${GIT_PIDS[0]}"
         local label="${GIT_LABELS[0]}"
 
-        if wait "$pid"; then
+        if  "$pid"; then
             echo "✅ Git job completed: $label"
         else
             echo "❌ Git job failed: $label"
@@ -569,15 +570,15 @@ parallel_clone_or_update() {
     GIT_PIDS+=("$!")
     GIT_LABELS+=("$label")
 
-    wait_for_git_slot
+    _for_git_slot
 }
 
-wait_for_all_git() {
+_for_all_git() {
     while ((${#GIT_PIDS[@])); do
         local pid="${GIT_PIDS[0]}"
         local label="${GIT_LABELS[0]}"
 
-        if wait "$pid"; then
+        if  "$pid"; then
             echo "✅ Git job completed: $label"
         else
             echo "❌ Git job failed: $label"
@@ -809,7 +810,7 @@ done
 
 # Make sure every clone/update has finished before touching the shared
 # Python environment.
-wait_for_all_git
+_for_all_git
 
 install_all_node_requirements || {
     append_failure "shared node dependencies"
@@ -874,34 +875,6 @@ mkdir -p \
     "$COMFY_DIR/models/vae_approx" 
 
 # ------------------------- Download helpers ----------------------------------
-# Fetch the primary SHA-256 recorded by Civitai for a model version.
-# This avoids hard-coding a Civitai hash that may be wrong for a particular
-# version ID, while keeping the token out of the URL.
-civitai_sha256() {
-    local version_id="$1"
-    local file_id="$2"
-    local metadata
-
-    metadata="$(curl -fsSL \
-        --retry 3 --retry-all-errors --connect-timeout 20 --max-time 60 \
-        -H "Authorization: Bearer $API_TOKEN" \
-        "https://civitai.com/api/v1/model-versions/$version_id")"
-
-    jq -er --argjson file_id "$file_id" '
-        .files[]
-        | select(.id == $file_id)
-        | .hashes.SHA256 // empty
-    ' <<<"$metadata"
-}
-
-civitai_size() {
-    local version_id="$1"
-    curl -fsSL \
-        --retry 3 --retry-all-errors --connect-timeout 20 --max-time 60 \
-        -H "Authorization: Bearer $API_TOKEN" \
-        "https://civitai.com/api/v1/model-versions/mini/$version_id" | \
-        jq -er '.size // empty | floor'
-}
 
 download_file() {
     local dest_dir="$1"
@@ -909,7 +882,6 @@ download_file() {
     local url="$3"
     local min_bytes="$4"
     local expected_sha256="${5:-}"
-    local auth_mode="${6:-none}"
 
     local dest="$dest_dir/$filename"
     local part="$dest_dir/.${filename}.part"
@@ -941,7 +913,7 @@ download_file() {
         --file-allocation=none
         --continue=true
         --max-tries=3
-        --retry-wait=3
+        --retry-=3
         --split="$ARIA2_SPLIT"
         --max-connection-per-server="$ARIA2_CONNECTIONS"
         --min-split-size=20M
@@ -953,44 +925,23 @@ download_file() {
         --out=".${filename}.part"
     )
 
-           if [[ "$auth_mode" == "civitai" ]]; then
-        aria_args+=(--header="Authorization: Bearer $API_TOKEN")
-    fi
+    if ! aria2c "${aria_args[@]}" "$url"; then
+        echo "⚠️ aria2c failed for $filename; falling back to wget..."
+        rm -f "${part}.aria2"
 
-    if [[ "$auth_mode" == "civitai" ]]; then
-        echo "⬇️ Downloading Civitai asset with curl..."
-        if ! curl -fL \
-            --retry 3 \
-            --retry-all-errors \
-            --connect-timeout 30 \
-            --max-time 0 \
-            --continue-at - \
-            -H "Authorization: Bearer $API_TOKEN" \
-            -o "$part" \
-            "$url"; then
-            echo "❌ Failed to download $filename from Civitai"
-            rm -f "$part"
+        local -a wget_args=(
+            --no-verbose
+            --show-progress
+            --continue
+            --tries=3
+            --timeout=60
+            -O "$part"
+        )
+
+        if ! wget "${wget_args[@]}" "$url"; then
+            rm -f "$part" "${part}.aria2"
+            echo "❌ Failed to download $filename"
             return 1
-        fi
-    else
-        if ! aria2c "${aria_args[@]}" "$url"; then
-            echo "⚠️ aria2c failed for $filename; falling back to wget..."
-            rm -f "${part}.aria2"
-
-            local -a wget_args=(
-                --no-verbose
-                --show-progress
-                --continue
-                --tries=3
-                --timeout=60
-                -O "$part"
-            )
-
-            if ! wget "${wget_args[@]}" "$url"; then
-                rm -f "$part" "${part}.aria2"
-                echo "❌ Failed to download $filename"
-                return 1
-            fi
         fi
     fi
 
@@ -1005,6 +956,7 @@ download_file() {
     rm -f "${part}.aria2"
     echo "✅ Downloaded and verified $filename ($(human_size "$actual_size"))"
 }
+
 # ----------------------- Parallel download queue ------------------------------
 
 DOWNLOAD_PIDS=()
@@ -1055,52 +1007,119 @@ wait_for_all_downloads() {
     done
 }
 
-# ----------------------------- Civitai assets --------------------------------
-echo ""
-echo "================ Civitai Assets ================"
+# ------------------------- Hugging Face Xet download --------------------------
+download_hf_xet() {
+    local dest_dir="$1"
+    local remote_filename="$2"
+    local local_filename="$3"
+    local min_bytes="$4"
+    local expected_sha256="$5"
+    local repo_id="$6"
+    local revision="${7:-main}"
 
-CIVITAI_MODEL_VERSION_ID="${CIVITAI_MODEL_VERSION_ID:-3314686}"
-CIVITAI_MODEL_FILE_ID="${CIVITAI_MODEL_FILE_ID:-3203135}"
+    local dest="$dest_dir/$local_filename"
+    local xet_dir="${WORKSPACE}/.seed_hunter_hf_xet"
+    local downloaded
 
-CIVITAI_MODEL_SIZE_BYTES="$(civitai_size "$CIVITAI_MODEL_VERSION_ID" 2>/dev/null || true)"
-if [[ -n "$CIVITAI_MODEL_SIZE_BYTES" ]]; then
-    echo "📦 Civitai checkpoint size: $(human_size "$CIVITAI_MODEL_SIZE_BYTES")"
-fi
+    mkdir -p "$dest_dir" "$xet_dir"
 
-# Check disk immediately before the expensive model downloads.
-check_disk_space || exit 1
+    if [[ -f "$dest" ]]; then
+        echo "🔎 Checking existing $local_filename..."
+        if verify_file "$dest" "$min_bytes" "$expected_sha256"; then
+            echo "✅ $local_filename already verified; skipping."
+            return 0
+        fi
 
-# Verify that the version exists and obtain the server-recorded SHA-256.
-CIVITAI_MODEL_SHA256="$(civitai_sha256 "$CIVITAI_MODEL_VERSION_ID" "$CIVITAI_MODEL_FILE_ID")" || {
-    echo "❌ Could not obtain the Civitai SHA-256 for version $CIVITAI_MODEL_VERSION_ID."
-    append_failure "Civitai model metadata: $CIVITAI_MODEL_VERSION_ID"
-    CIVITAI_MODEL_SHA256=""
+        echo "⚠️ Existing $local_filename failed validation; replacing it."
+        rm -f "$dest"
+    fi
+
+    if [[ -z "${HF_TOKEN:-}" ]]; then
+        echo "❌ HF_TOKEN is not set; cannot download private Hugging Face model."
+        return 1
+    fi
+
+    echo "⬇️ Downloading $remote_filename from Hugging Face using Xet..."
+
+    downloaded="$(
+        "$PYTHON_CMD" - "$repo_id" "$remote_filename" "$xet_dir" "$revision" <<'PY'
+import os
+import sys
+from huggingface_hub import hf_hub_download
+
+repo_id = sys.argv[1]
+filename = sys.argv[2]
+local_dir = sys.argv[3]
+revision = sys.argv[4]
+
+token = os.environ.get("HF_TOKEN")
+if not token:
+    raise RuntimeError("HF_TOKEN is not set")
+
+path = hf_hub_download(
+    repo_id=repo_id,
+    filename=filename,
+    revision=revision,
+    token=token,
+    local_dir=local_dir,
+)
+
+print(path)
+PY
+    )" || {
+        echo "❌ Hugging Face Xet download failed for $remote_filename"
+        return 1
+    }
+
+    if [[ ! -f "$downloaded" ]]; then
+        echo "❌ Hugging Face returned an invalid download path:"
+        echo "   $downloaded"
+        return 1
+    fi
+
+    mv -f "$downloaded" "$dest"
+
+    if ! verify_file "$dest" "$min_bytes" "$expected_sha256"; then
+        echo "❌ Downloaded $local_filename failed validation."
+        rm -f "$dest"
+        return 1
+    fi
+
+    echo "✅ Downloaded and verified $local_filename ($(human_size "$(file_size "$dest")"))"
 }
 
-if [[ -n "$CIVITAI_MODEL_SHA256" ]]; then
-    parallel_download \
-        "Civitai checkpoint download"  \
-        "$COMFY_DIR/models/checkpoints" \
-        "DasiwaMinimaxH3_dasiwaHybridTurboV2_int8.safetensors" \
-        "https://civitai.com/api/download/models/$CIVITAI_MODEL_VERSION_ID?fileId=$CIVITAI_MODEL_FILE_ID" \
-        5000000000 \
-        "$CIVITAI_MODEL_SHA256" \
-        civitai 
-else
-    echo "⏭️ Skipping checkpoint download because its expected hash could not be established."
-fi
+parallel_hf_xet_download() {
+    local label="$1"
+    shift
+
+    download_hf_xet "$@" &
+    DOWNLOAD_PIDS+=("$!")
+    DOWNLOAD_LABELS+=("$label")
+
+    wait_for_download_slot
+}
 
 # --------------------------- Hugging Face assets -----------------------------
 echo ""
 echo "================ Hugging Face Assets ================"
+
+parallel_hf_xet_download \
+    "MiniMax H3 checkpoint" \
+    "$COMFY_DIR/models/checkpoints" \
+    "DasiwaMinimaxH3_dasiwaHybridTurboV2_3203135.safetensors" \
+    "DasiwaMinimaxH3_dasiwaHybridTurboV2_int8.safetensors" \
+    19000000000 \
+    "37c17fd91971c17e02e60798a05eec48d881e1bb970d6309f58cf134a2d03a6b" \
+    "Eryndiel/model" \
+    "main"
+
 parallel_download \
     "Qwen3-VL H3 text encoder" \
     "$COMFY_DIR/models/text_encoders" \
     "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors" \
     "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors" \
     15000000000 \
-    "35a88d51044231fe332301d7a62aa81e3f2cba62febeb446e2c1e3e0ef76f2c6" \
-    none 
+    "35a88d51044231fe332301d7a62aa81e3f2cba62febeb446e2c1e3e0ef76f2c6" 
 
 parallel_download \
     "latent upscaler" \
@@ -1108,8 +1127,7 @@ parallel_download \
     "minimax_h3_latent_upscaler_3d_conv_v1_fp16.safetensors" \
     "https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler/resolve/main/minimax_h3_latent_upscaler_3d_conv_v1/minimax_h3_latent_upscaler_3d_conv_v1_fp16.safetensors" \
     650000000 \
-    "043e5a48e161610ef6c3ea974645220354d06fa618abca15f76d084812eb55c2" \
-    none 
+    "043e5a48e161610ef6c3ea974645220354d06fa618abca15f76d084812eb55c2" 
 
 parallel_download \
     "Turbo LoRA" \
@@ -1117,8 +1135,7 @@ parallel_download \
     "minimax_h3_fl2v_turbo_silver_dareties_comfy_pruned_v1.safetensors" \
     "https://huggingface.co/silveroxides/MiniMax-H3_tests/resolve/main/minimax_h3_fl2v_turbo_silver_dareties_comfy_pruned_v1.safetensors" \
     725000000 \
-    "9aab6353ce76f0a1c6a6fbbeaa1a4c60deced365e328bc14ddb0b7b9f0849b48" \
-    none 
+    "9aab6353ce76f0a1c6a6fbbeaa1a4c60deced365e328bc14ddb0b7b9f0849b48" 
 
 parallel_download \
     "MiniMax H3 video VAE" \
@@ -1126,8 +1143,7 @@ parallel_download \
     "minimax_h3_video_vae_int8_convrot.safetensors" \
     "https://huggingface.co/Kijai/MiniMax-H3-experimental/resolve/main/minimax_h3_video_vae_int8_convrot.safetensors" \
     3000000000 \
-    "9bb2d96f218c76babd85e0611b85ca8fb330a90546c01a0005e8a58a59593410" \
-    none 
+    "9bb2d96f218c76babd85e0611b85ca8fb330a90546c01a0005e8a58a59593410" 
 
 parallel_download \
     "MiniMax H3 audio VAE" \
@@ -1135,8 +1151,7 @@ parallel_download \
     "minimax_h3_audio_vae_fp32.safetensors" \
     "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_audio_vae_fp32.safetensors" \
     600000000 \
-    "8e505d95dd1561d47abd43d4238fd40d9bb1ae9e147ed0a4cba778d76ae4db48" \
-    none 
+    "8e505d95dd1561d47abd43d4238fd40d9bb1ae9e147ed0a4cba778d76ae4db48" 
 
 parallel_download \
     "TAE H3 approximate VAE" \
@@ -1144,8 +1159,7 @@ parallel_download \
     "taeh3.safetensors" \
     "https://huggingface.co/Kijai/MiniMax-H3-TAE/resolve/main/vae_approx/taeh3.safetensors" \
     9000000 \
-    "f0f60fa072089997f817402098c2fd90777cb2660dd79cf5df42fc1e3e08e527" \
-    none 
+    "f0f60fa072089997f817402098c2fd90777cb2660dd79cf5df42fc1e3e08e527" 
 
 wait_for_all_downloads
 
