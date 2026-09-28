@@ -1,0 +1,43 @@
+#!/bin/bash
+set -euo pipefail
+
+PROVISIONER_PY="/opt/instance-tools/provisioner/venv/bin/python"
+PROVISIONER_BIN="/opt/instance-tools/bin/provisioner"
+
+echo "🚀 Installing Hugging Face Xet into Vast provisioner..."
+
+uv pip install \
+    --python "$PROVISIONER_PY" \
+    -U "huggingface_hub" "hf_xet"
+
+echo "✅ Provisioner Xet packages installed."
+
+# Make Xet settings available to the provisioner itself.
+python3 - <<'PY'
+from pathlib import Path
+
+path = Path("/opt/instance-tools/bin/provisioner")
+text = path.read_text()
+
+marker = 'export PYTHONPATH="/opt/instance-tools/lib:${PYTHONPATH:-}"'
+
+injected = '''export HF_HOME="${HF_HOME:-/workspace/.cache/huggingface}"
+export HF_XET_CACHE="${HF_XET_CACHE:-/workspace/.cache/huggingface/xet}"
+export HF_XET_HIGH_PERFORMANCE="${HF_XET_HIGH_PERFORMANCE:-1}"
+'''
+
+if 'HF_XET_CACHE=' not in text:
+    text = text.replace(marker, injected + marker)
+    path.write_text(text)
+
+print("✅ Provisioner Xet environment configured.")
+PY
+
+"$PROVISIONER_PY" -c '
+import huggingface_hub
+import hf_xet
+print("✅ huggingface_hub:", huggingface_hub.__version__)
+print("✅ hf_xet:", hf_xet.__version__)
+'
+
+echo "✅ Vast provisioner is ready to use Xet."
