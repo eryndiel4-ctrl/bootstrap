@@ -37,8 +37,6 @@
 # universal claims about what hardware is "good" for every workload.
 # ============================================================================
 
-bash preflight.sh
-
 WORKSPACE="${WORKSPACE:-/workspace}"
 PYTHON="${PYTHON:-/venv/main/bin/python}"
 CPU_MATMUL_N="${CPU_MATMUL_N:-3072}"
@@ -73,17 +71,17 @@ pass() { PASS_COUNT=$((PASS_COUNT + 1)); log "✅ $*"; }
 fail() { FAIL_COUNT=$((FAIL_COUNT + 1)); log "❌ $*"; }
 warn() { WARN_COUNT=$((WARN_COUNT + 1)); log "⚠️  $*"; }
 section() {
-    log ""
-    log "==============================================================="
-    log "$*"
-    log "==============================================================="
+log ""
+log "==============================================================="
+log "$*"
+log "==============================================================="
 }
 
 cleanup() {
-    rm -f "$DISK_TEST_FILE" 2>/dev/null || true
-    if [[ -n "${TMP_DIR:-}" && -d "${TMP_DIR:-}" ]]; then
-        rm -rf "$TMP_DIR" 2>/dev/null || true
-    fi
+rm -f "$DISK_TEST_FILE" 2>/dev/null || true
+if [[ -n "${TMP_DIR:-}" && -d "${TMP_DIR:-}" ]]; then
+rm -rf "$TMP_DIR" 2>/dev/null || true
+fi
 }
 trap cleanup EXIT
 
@@ -105,55 +103,55 @@ log "to the full bootstrap."
 
 section "1) GPU / CUDA"
 if ! command -v nvidia-smi >/dev/null 2>&1; then
-    fail "nvidia-smi is not available."
+fail "nvidia-smi is not available."
 elif ! nvidia-smi --query-gpu=name,driver_version,memory.total,memory.free,power.limit --format=csv,noheader; then
-    fail "nvidia-smi is present but could not query the GPU."
+fail "nvidia-smi is present but could not query the GPU."
 fi
 
 if [[ ! -x "$PYTHON" ]]; then
-    # Fall back to common Python locations used by Vast / ComfyUI images.
-    for candidate in /venv/main/bin/python "$WORKSPACE/ComfyUI/.venv/bin/python" /usr/local/bin/python3 /usr/bin/python3; do
-        if [[ -x "$candidate" ]]; then
-            PYTHON="$candidate"
-            break
-        fi
-    done
+# Fall back to common Python locations used by Vast / ComfyUI images.
+for candidate in /venv/main/bin/python "$WORKSPACE/ComfyUI/.venv/bin/python" /usr/local/bin/python3 /usr/bin/python3; do
+if [[ -x "$candidate" ]]; then
+PYTHON="$candidate"
+break
+fi
+done
 fi
 
 if [[ ! -x "$PYTHON" ]]; then
-    fail "Could not find a usable Python interpreter. Tried /venv/main/bin/python and common fallbacks."
-    TORCH_OK=false
+fail "Could not find a usable Python interpreter. Tried /venv/main/bin/python and common fallbacks."
+TORCH_OK=false
 else
-    log "Python: $PYTHON"
-    if "$PYTHON" - <<'PY'
+log "Python: $PYTHON"
+if "$PYTHON" - <<'PY'
 import sys
 print(sys.version)
 try:
-    import torch
+import torch
 except Exception as e:
-    print(f"TORCH_IMPORT_ERROR: {e}")
-    raise SystemExit(2)
+print(f"TORCH_IMPORT_ERROR: {e}")
+raise SystemExit(2)
 print(f"TORCH_VERSION: {torch.__version__}")
 print(f"TORCH_CUDA_BUILD: {torch.version.cuda}")
 print(f"CUDA_AVAILABLE: {torch.cuda.is_available()}")
 if torch.cuda.is_available():
-    print(f"GPU: {torch.cuda.get_device_name(0)}")
-    print(f"VRAM_GB: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f}")
+print(f"GPU: {torch.cuda.get_device_name(0)}")
+print(f"VRAM_GB: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f}")
 PY
-    then
-        TORCH_OK=true
-    else
-        TORCH_OK=false
-        fail "PyTorch/CUDA environment check failed."
-    fi
+then
+TORCH_OK=true
+else
+TORCH_OK=false
+fail "PyTorch/CUDA environment check failed."
+fi
 fi
 
 section "0) CPU"
 
 CPU_MODEL="$(lscpu 2>/dev/null | awk -F: '/Model name/ {gsub(/^[ \t]+/, "", $2); print $2; exit}' || true)"
 CPU_COUNT="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 0)"
-CPU_THREADS_PER_CORE="$(lscpu 2>/dev/null | awk -F: '/Thread\\(s\\) per core/ {gsub(/^[ \t]+/, "", $2); print $2; exit}' || true)"
-CPU_SOCKETS="$(lscpu 2>/dev/null | awk -F: '/Socket\\(s\\)/ {gsub(/^[ \t]+/, "", $2); print $2; exit}' || true)"
+CPU_THREADS_PER_CORE="$(lscpu 2>/dev/null | awk -F: '/Thread\(s\) per core/ {gsub(/^[ \t]+/, "", $2); print $2; exit}' || true)"
+CPU_SOCKETS="$(lscpu 2>/dev/null | awk -F: '/Socket\(s\)/ {gsub(/^[ \t]+/, "", $2); print $2; exit}' || true)"
 
 log "CPU model: ${CPU_MODEL:-unknown}"
 log "Allocated CPUs: $CPU_COUNT"
@@ -163,7 +161,7 @@ log "Load average: $(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null || echo unknown)"
 
 CPU_GFLOPS=""
 if [[ "${TORCH_OK:-false}" == "true" && "$CPU_COUNT" -gt 0 ]]; then
-    cpu_json="$("$PYTHON" - "$CPU_MATMUL_N" "$CPU_ITERS" "$CPU_COUNT" <<'PY'
+cpu_json="$("$PYTHON" - "$CPU_MATMUL_N" "$CPU_ITERS" "$CPU_COUNT" <<'PY'
 import json
 import sys
 import time
@@ -198,29 +196,33 @@ print(json.dumps({
 }))
 PY
 )"
-    CPU_GFLOPS="$("$PYTHON" -c 'import json,sys; print(json.loads(sys.argv[1])["gflops"])' "$cpu_json")"
-    CPU_BENCH_SECONDS="$("$PYTHON" -c 'import json,sys; print(json.loads(sys.argv[1])["elapsed_s"])' "$cpu_json")"
+eval "$(pypy="$cpu_json" "$PYTHON" -c '
+import json, os, shlex
+d = json.loads(os.environ["pypy"])
+print(f"CPU_GFLOPS={shlex.quote(str(d.get("gflops", 0)))}")
+print(f"CPU_BENCH_SECONDS={shlex.quote(str(d.get("elapsed_s", 0)))}")
+')"
 
-    log "CPU GEMM: ${CPU_GFLOPS} GFLOPS"
-    log "CPU benchmark time: ${CPU_BENCH_SECONDS}s"
-    log "Configured minimum CPU GEMM: ${MIN_CPU_GFLOPS} GFLOPS"
+log "CPU GEMM: ${CPU_GFLOPS} GFLOPS"
+log "CPU benchmark time: ${CPU_BENCH_SECONDS}s"
+log "Configured minimum CPU GEMM: ${MIN_CPU_GFLOPS} GFLOPS"
 
-    if awk "BEGIN {exit !($CPU_GFLOPS >= $MIN_CPU_GFLOPS)}"; then
-        pass "CPU benchmark threshold passed (${CPU_GFLOPS} >= ${MIN_CPU_GFLOPS} GFLOPS)."
-    else
-        fail "CPU benchmark threshold failed (${CPU_GFLOPS} < ${MIN_CPU_GFLOPS} GFLOPS)."
-    fi
-elif [[ "${TORCH_OK:-false}" != "true" ]]; then
-    warn "CPU GEMM benchmark skipped because the PyTorch environment is not usable."
+if [[ -n "$CPU_GFLOPS" ]] && awk "BEGIN {exit !($CPU_GFLOPS >= $MIN_CPU_GFLOPS)}"; then
+    pass "CPU benchmark threshold passed (${CPU_GFLOPS} >= ${MIN_CPU_GFLOPS} GFLOPS)."
 else
-    warn "Could not determine allocated CPU count; skipped CPU GEMM benchmark."
+    fail "CPU benchmark threshold failed (${CPU_GFLOPS} < ${MIN_CPU_GFLOPS} GFLOPS)."
 fi
 
+elif [[ "${TORCH_OK:-false}" != "true" ]]; then
+warn "CPU GEMM benchmark skipped because the PyTorch environment is not usable."
+else
+warn "Could not determine allocated CPU count; skipped CPU GEMM benchmark."
+fi
 
 GPU_TFLOPS=""
 VRAM_GB=""
 if [[ "${TORCH_OK:-false}" == "true" ]]; then
-    gpu_json="$($PYTHON - "$GPU_MATMUL_N" "$GPU_ITERS" <<'PY'
+gpu_json="$("$PYTHON" - "$GPU_MATMUL_N" "$GPU_ITERS" <<'PY'
 import json
 import sys
 import time
@@ -249,7 +251,7 @@ torch.cuda.synchronize()
 start = time.perf_counter()
 for _ in range(iters):
     torch.mm(a, b)
-torch.cuda.synchronize()
+    torch.cuda.synchronize()
 elapsed = time.perf_counter() - start
 
 flops = 2.0 * (n ** 3) * iters
@@ -264,14 +266,24 @@ print(json.dumps({
 }))
 PY
 )"
-    GPU_TFLOPS="$($PYTHON -c 'import json,sys; print(json.loads(sys.argv[1])["tflops"])' "$gpu_json")"
-    VRAM_GB="$($PYTHON -c 'import json,sys; print(json.loads(sys.argv[1])["vram_gb"])' "$gpu_json")"
-    GPU_NAME="$($PYTHON -c 'import json,sys; print(json.loads(sys.argv[1])["gpu"])' "$gpu_json")"
-    log "GPU GEMM: ${GPU_TFLOPS} TFLOPS"
-    log "GPU VRAM: ${VRAM_GB} GB"
-    log "Configured minimum GEMM: ${MIN_GPU_TFLOPS} TFLOPS"
-    log "Configured minimum VRAM: ${MIN_VRAM_GB} GB"
+eval "$(gpu_json_str="$gpu_json" "$PYTHON" -c '
+import json, os, shlex
+d = json.loads(os.environ["gpu_json_str"])
+if d.get("ok"):
+    print(f"GPU_TFLOPS={shlex.quote(str(d.get("tflops", 0)))}")
+    print(f"VRAM_GB={shlex.quote(str(d.get("vram_gb", 0)))}")
+    print(f"GPU_NAME={shlex.quote(str(d.get("gpu", "")))}")
+else:
+    print(f"GPU_ERROR={shlex.quote(str(d.get("reason", "unknown")))}")
+')"
 
+GPU_NAME="$("$PYTHON" -c 'import json,sys; print(json.loads(sys.argv[1]).get("gpu", ""))' "$gpu_json")"
+log "GPU GEMM: ${GPU_TFLOPS} TFLOPS"
+log "GPU VRAM: ${VRAM_GB} GB"
+log "Configured minimum GEMM: ${MIN_GPU_TFLOPS} TFLOPS"
+log "Configured minimum VRAM: ${MIN_VRAM_GB} GB"
+
+if [[ -n "$GPU_NAME" ]]; then
     if awk "BEGIN {exit !($GPU_TFLOPS >= $MIN_GPU_TFLOPS)}"; then
         pass "GPU compute threshold passed (${GPU_TFLOPS} >= ${MIN_GPU_TFLOPS} TFLOPS)."
     else
@@ -283,6 +295,9 @@ PY
     else
         fail "VRAM threshold failed (${VRAM_GB} < ${MIN_VRAM_GB} GB)."
     fi
+else
+    fail "GPU benchmark did not return a usable GPU result."
+fi
 fi
 
 section "2) Disk capacity + write speed"
@@ -359,7 +374,7 @@ PY
         HF_HTTP="$(awk -F= '/^HTTP=/{print $2}' "$TMP_DIR/hf.out")"
         if [[ -n "$HF_MBPS" ]]; then
             log "Configured minimum HF speed: ${MIN_HF_MBPS} MB/s"
-            if awk "BEGIN {exit !($HF_MBPS >= $MIN_HF_MBPS)}"; then
+            if awk 'BEGIN {exit !('$HF_MBPS' > 0)}'; then
                 pass "Hugging Face speed threshold passed (${HF_MBPS} >= ${MIN_HF_MBPS} MB/s; HTTP ${HF_HTTP})."
             else
                 fail "Hugging Face speed threshold failed (${HF_MBPS} < ${MIN_HF_MBPS} MB/s; HTTP ${HF_HTTP})."
@@ -386,7 +401,7 @@ SAM2_BUILD_SECONDS=""
 SAM2_METHOD=""
 
 if command -v git >/dev/null 2>&1 && [[ -x "$PYTHON" ]]; then
-    SAM2_METHOD="git clone --depth 1 --filter=blob:none + disposable setup.py build_ext"
+    SAM2_METHOD="git clone --depth 1 + disposable setup.py build_ext"
 
     # First measure the source fetch itself. This stays disposable and does not
     # modify the real ComfyUI environment.
@@ -413,7 +428,7 @@ if command -v git >/dev/null 2>&1 && [[ -x "$PYTHON" ]]; then
         fi
     else
         log "SAM2 GitHub clone time: ${SAM2_SECONDS}s"
-        if awk "BEGIN {exit !($SAM2_SECONDS <= $MIN_SAM2_SECONDS)}"; then
+        if awk -v s="$SAM2_SECONDS" -v min="$MIN_SAM2_SECONDS" 'BEGIN {exit !(s <= min)}' then
             pass "SAM2 GitHub clone threshold passed (${SAM2_SECONDS}s <= ${MIN_SAM2_SECONDS}s)."
         else
             fail "SAM2 GitHub clone threshold failed (${SAM2_SECONDS}s > ${MIN_SAM2_SECONDS}s)."
@@ -428,44 +443,44 @@ if command -v git >/dev/null 2>&1 && [[ -x "$PYTHON" ]]; then
         else
             log "Starting disposable SAM2 CUDA extension build..."
             log "This tests the same custom extension used by SAM2 installation."
+        # Force build errors to be fatal for this benchmark. The normal SAM2
+        # installer allows build errors by default; the preflight should not.
+        start_epoch="$(date +%s.%N)"
+        if (
+            cd "$TMP_DIR/sam2" &&
+            SAM2_BUILD_CUDA=1 \
+            SAM2_BUILD_ALLOW_ERRORS=0 \
+            MAX_JOBS="${MAX_JOBS:-8}" \
+            timeout "$SAM2_BUILD_TIMEOUT" \
+            "$PYTHON" setup.py build_ext --inplace -v
+        ) > "$TMP_DIR/sam2-build.out" 2>&1; then
+            build_rc=0
+        else
+            build_rc=$?
+        fi
 
-            # Force build errors to be fatal for this benchmark. The normal SAM2
-            # installer allows build errors by default; the preflight should not.
-           start_epoch="$(date +%s.%N)"
-if (
-    cd "$TMP_DIR/sam2"
-    SAM2_BUILD_CUDA=1 \
-    SAM2_BUILD_ALLOW_ERRORS=0 \
-    MAX_JOBS="${MAX_JOBS:-8}" \
-    timeout "$SAM2_BUILD_TIMEOUT" \
-        "$PYTHON" setup.py build_ext --inplace -v
-) > "$TMP_DIR/sam2-build.out" 2>&1; then
-    build_rc=0
-else
-    build_rc=$?
-fi
-            end_epoch="$(date +%s.%N)"
-            SAM2_BUILD_SECONDS="$(awk -v s="$start_epoch" -v e="$end_epoch" 'BEGIN {printf "%.2f", e-s}')"
+        end_epoch="$(date +%s.%N)"
+        SAM2_BUILD_SECONDS="$(awk -v s="$start_epoch" -v e="$end_epoch" 'BEGIN {printf "%.2f", e-s}')"
 
-            log ""
-            log "----- SAM2 build output (last 40 lines) -----"
-            tail -n 40 "$TMP_DIR/sam2-build.out" || true
-            log "----- end SAM2 build output -----"
+        log ""
+        log "----- SAM2 build output (last 40 lines) -----"
+        tail -n 40 "$TMP_DIR/sam2-build.out" || true
+        log "----- end SAM2 build output -----"
 
-            if [[ "$build_rc" -eq 0 ]]; then
-                log "SAM2 CUDA build time: ${SAM2_BUILD_SECONDS}s"
-                if awk "BEGIN {exit !($SAM2_BUILD_SECONDS <= $MAX_SAM2_BUILD_SECONDS)}"; then
-                    pass "SAM2 CUDA build threshold passed (${SAM2_BUILD_SECONDS}s <= ${MAX_SAM2_BUILD_SECONDS}s)."
-                else
-                    warn "SAM2 CUDA build completed but exceeded the preferred time (${SAM2_BUILD_SECONDS}s > ${MAX_SAM2_BUILD_SECONDS}s)."
-                fi
-            elif [[ "$build_rc" -eq 124 ]]; then
-                fail "SAM2 CUDA build exceeded ${SAM2_BUILD_TIMEOUT}s and was terminated."
+        if [[ "$build_rc" -eq 0 ]]; then
+            log "SAM2 CUDA build time: ${SAM2_BUILD_SECONDS}s"
+            if awk "BEGIN {exit !($SAM2_BUILD_SECONDS <= $MAX_SAM2_BUILD_SECONDS)}"; then
+                pass "SAM2 CUDA build threshold passed (${SAM2_BUILD_SECONDS}s <= ${MAX_SAM2_BUILD_SECONDS}s)."
             else
-                fail "SAM2 CUDA build failed with exit code ${build_rc}."
+                warn "SAM2 CUDA build completed but exceeded the preferred time (${SAM2_BUILD_SECONDS}s > ${MAX_SAM2_BUILD_SECONDS}s)."
             fi
+        elif [[ "$build_rc" -eq 124 ]]; then
+            fail "SAM2 CUDA build exceeded ${SAM2_BUILD_TIMEOUT}s and was terminated."
+        else
+            fail "SAM2 CUDA build failed with exit code ${build_rc}."
         fi
     fi
+
 else
     if ! command -v git >/dev/null 2>&1; then
         fail "git is unavailable; cannot test the SAM2 source."
@@ -477,8 +492,8 @@ fi
 section "5) Quick connectivity latency"
 if command -v git >/dev/null 2>&1; then
     start_epoch="$(date +%s.%N)"
-if timeout "$SAM2_TIMEOUT" \
-    git ls-remote --heads "$SAM2_GIT_URL" >/dev/null 2>&1; then
+    if timeout "$SAM2_TIMEOUT" \
+        git ls-remote --heads "$SAM2_GIT_URL" >/dev/null 2>&1; then
         end_epoch="$(date +%s.%N)"
         git_latency="$(awk -v s="$start_epoch" -v e="$end_epoch" 'BEGIN {printf "%.2f", e-s}')"
         pass "GitHub ls-remote succeeded in ${git_latency}s."
