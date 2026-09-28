@@ -1,0 +1,402 @@
+#!/usr/bin/env bash
+# ============================================================================
+# Vast.ai GPU / Network Preflight for the MiniMax H3 / Seed Hunter bootstrap
+#
+# Purpose:
+#   Rent a Vast.ai GPU, run this script first, and decide whether the machine's
+#   GPU, disk, Hugging Face path, and SAM2/GitHub path are fast enough BEFORE
+#   running the full bootstrap.
+#
+# Exit codes:
+#   0 = all enabled required checks passed
+#   1 = one or more required checks failed
+#   2 = usage/configuration error
+#
+# Main environment variables:
+#   WORKSPACE=/workspace
+#   PYTHON=/venv/main/bin/python
+#   GPU_MATMUL_N=8192
+#   GPU_ITERS=12
+#   DISK_TEST_GB=1
+#   HF_TEST_MB=128
+#   HF_TEST_URL=<your HF URL>               # defaults to the H3 Qwen encoder
+#   SAM2_GIT_URL=https://github.com/facebookresearch/sam2.git
+#   SAM2_TIMEOUT=180
+#   MIN_HF_MBPS=20
+#   MAX_SAM2_SECONDS=180
+#   MIN_DISK_MBPS=100
+#   MIN_GPU_TFLOPS=20
+#   MIN_VRAM_GB=0                           # set, e.g. 24, if desired
+#
+# The thresholds are intentionally configurable: they are decision aids, not
+# universal claims about what hardware is "good" for every workload.
+# ============================================================================
+
+set -Eeuo pipefail
+
+WORKSPACE="${WORKSPACE:-/workspace}"
+PYTHON="${PYTHON:-/venv/main/bin/python}"
+GPU_MATMUL_N="${GPU_MATMUL_N:-8192}"
+GPU_ITERS="${GPU_ITERS:-12}"
+DISK_TEST_GB="${DISK_TEST_GB:-1}"
+HF_TEST_MB="${HF_TEST_MB:-128}"
+HF_TEST_URL="${HF_TEST_URL:-https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors?download=true}"
+SAM2_GIT_URL="${SAM2_GIT_URL:-https://github.com/facebookresearch/sam2.git}"
+SAM2_TIMEOUT="${SAM2_TIMEOUT:-180}"
+MIN_HF_MBPS="${MIN_HF_MBPS:-20}"
+MAX_SAM2_SECONDS="${MAX_SAM2_SECONDS:-180}"
+MIN_DISK_MBPS="${MIN_DISK_MBPS:-100}"
+MIN_GPU_TFLOPS="${MIN_GPU_TFLOPS:-20}"
+MIN_VRAM_GB="${MIN_VRAM_GB:-0}"
+HF_TIMEOUT="${HF_TIMEOUT:-120}"
+DISK_TEST_FILE="${WORKSPACE}/.vast_preflight_disk_test.bin"
+REPORT_FILE="${REPORT_FILE:-${WORKSPACE}/vast-gpu-preflight-report.txt}"
+
+TOTAL_H3_ASSET_BYTES=39989254808
+
+PASS_COUNT=0
+FAIL_COUNT=0
+WARN_COUNT=0
+
+log() { printf '%s\n' "$*"; }
+pass() { PASS_COUNT=$((PASS_COUNT + 1)); log "✅ $*"; }
+fail() { FAIL_COUNT=$((FAIL_COUNT + 1)); log "❌ $*"; }
+warn() { WARN_COUNT=$((WARN_COUNT + 1)); log "⚠️  $*"; }
+section() {
+    log ""
+    log "==============================================================="
+    log "$*"
+    log "==============================================================="
+}
+
+cleanup() {
+    rm -f "$DISK_TEST_FILE" 2>/dev/null || true
+    if [[ -n "${TMP_DIR:-}" && -d "${TMP_DIR:-}" ]]; then
+        rm -rf "$TMP_DIR" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT
+
+mkdir -p "$WORKSPACE"
+TMP_DIR="$(mktemp -d "${WORKSPACE%/}/.vast_preflight.XXXXXX")"
+
+# Tee all visible output into a report file without requiring tee-specific
+# behavior from the caller's terminal.
+exec > >(tee "$REPORT_FILE") 2>&1
+
+section "Vast.ai MiniMax H3 / Seed Hunter Preflight"
+log "Started: $(date -Iseconds)"
+log "Workspace: $WORKSPACE"
+log "Report: $REPORT_FILE"
+log ""
+log "This test does NOT install your custom nodes and does NOT download the"
+log "full model bundle. It is intended to be safe to run before committing"
+log "to the full bootstrap."
+
+section "1) GPU / CUDA"
+if ! command -v nvidia-smi >/dev/null 2>&1; then
+    fail "nvidia-smi is not available."
+else
+    nvidia-smi --query-gpu=name,driver_version,memory.total,memory.free,power.limit --format=csv,noheader || true
+fi
+
+if [[ ! -x "$PYTHON" ]]; then
+    # Fall back to common Python locations used by Vast / ComfyUI images.
+    for candidate in /venv/main/bin/python "$WORKSPACE/ComfyUI/.venv/bin/python" /usr/local/bin/python3 /usr/bin/python3; do
+        if [[ -x "$candidate" ]]; then
+            PYTHON="$candidate"
+            break
+        fi
+    done
+fi
+
+if [[ ! -x "$PYTHON" ]]; then
+    fail "Could not find a usable Python interpreter. Tried /venv/main/bin/python and common fallbacks."
+    TORCH_OK=false
+else
+    log "Python: $PYTHON"
+    if "$PYTHON" - <<'PY'
+import sys
+print(sys.version)
+try:
+    import torch
+except Exception as e:
+    print(f"TORCH_IMPORT_ERROR: {e}")
+    raise SystemExit(2)
+print(f"TORCH_VERSION: {torch.__version__}")
+print(f"TORCH_CUDA_BUILD: {torch.version.cuda}")
+print(f"CUDA_AVAILABLE: {torch.cuda.is_available()}")
+if torch.cuda.is_available():
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print(f"VRAM_GB: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f}")
+PY
+    then
+        TORCH_OK=true
+    else
+        TORCH_OK=false
+        fail "PyTorch/CUDA environment check failed."
+    fi
+fi
+
+GPU_TFLOPS=""
+VRAM_GB=""
+if [[ "${TORCH_OK:-false}" == "true" ]]; then
+    gpu_json="$($PYTHON - "$GPU_MATMUL_N" "$GPU_ITERS" <<'PY'
+import json
+import sys
+import time
+
+import torch
+
+n = int(sys.argv[1])
+iters = int(sys.argv[2])
+
+if not torch.cuda.is_available():
+    print(json.dumps({"ok": False, "reason": "CUDA unavailable"}))
+    raise SystemExit(1)
+
+props = torch.cuda.get_device_properties(0)
+vr = props.total_memory / 1e9
+
+# Keep the benchmark short but large enough to exercise the tensor cores on
+# common Ampere/Hopper/Blackwell rentals.
+a = torch.randn((n, n), device="cuda", dtype=torch.float16)
+b = torch.randn((n, n), device="cuda", dtype=torch.float16)
+
+for _ in range(4):
+    torch.mm(a, b)
+torch.cuda.synchronize()
+
+start = time.perf_counter()
+for _ in range(iters):
+    torch.mm(a, b)
+torch.cuda.synchronize()
+elapsed = time.perf_counter() - start
+
+flops = 2.0 * (n ** 3) * iters
+tflops = flops / elapsed / 1e12
+
+print(json.dumps({
+    "ok": True,
+    "gpu": torch.cuda.get_device_name(0),
+    "vram_gb": vr,
+    "elapsed_s": elapsed,
+    "tflops": tflops,
+}))
+PY
+)"
+    GPU_TFLOPS="$($PYTHON -c 'import json,sys; print(json.loads(sys.argv[1])["tflops"])' "$gpu_json")"
+    VRAM_GB="$($PYTHON -c 'import json,sys; print(json.loads(sys.argv[1])["vram_gb"])' "$gpu_json")"
+    GPU_NAME="$($PYTHON -c 'import json,sys; print(json.loads(sys.argv[1])["gpu"])' "$gpu_json")"
+    log "GPU GEMM: ${GPU_TFLOPS} TFLOPS"
+    log "GPU VRAM: ${VRAM_GB} GB"
+    log "Configured minimum GEMM: ${MIN_GPU_TFLOPS} TFLOPS"
+    log "Configured minimum VRAM: ${MIN_VRAM_GB} GB"
+
+    if awk "BEGIN {exit !($GPU_TFLOPS >= $MIN_GPU_TFLOPS)}"; then
+        pass "GPU compute threshold passed (${GPU_TFLOPS} >= ${MIN_GPU_TFLOPS} TFLOPS)."
+    else
+        fail "GPU compute threshold failed (${GPU_TFLOPS} < ${MIN_GPU_TFLOPS} TFLOPS)."
+    fi
+
+    if awk "BEGIN {exit !($VRAM_GB >= $MIN_VRAM_GB)}"; then
+        pass "VRAM threshold passed (${VRAM_GB} >= ${MIN_VRAM_GB} GB)."
+    else
+        fail "VRAM threshold failed (${VRAM_GB} < ${MIN_VRAM_GB} GB)."
+    fi
+fi
+
+section "2) Disk capacity + write speed"
+FREE_GB="$(df -Pk "$WORKSPACE" | awk 'NR==2 {printf "%.2f", $4/1024/1024}')"
+log "Free space on filesystem containing $WORKSPACE: ${FREE_GB} GB"
+if awk "BEGIN {exit !($FREE_GB >= 45)}"; then
+    pass "At least 45 GB free before bootstrap assets."
+else
+    fail "Less than 45 GB free. Your bootstrap needs roughly 40 GB of model assets plus working space."
+fi
+
+DISK_Mbps=""
+if command -v dd >/dev/null 2>&1; then
+    disk_bytes=$((DISK_TEST_GB * 1024 * 1024 * 1024))
+    start_epoch="$(date +%s.%N)"
+    if dd if=/dev/zero of="$DISK_TEST_FILE" bs=1M count=$((DISK_TEST_GB * 1024)) conv=fdatasync status=none; then
+        end_epoch="$(date +%s.%N)"
+        elapsed="$(awk -v s="$start_epoch" -v e="$end_epoch" 'BEGIN {print e-s}')"
+        DISK_Mbps="$(awk -v b="$disk_bytes" -v s="$elapsed" 'BEGIN {printf "%.2f", b/s/1000/1000}')"
+        log "Sequential write: ${DISK_Mbps} MB/s"
+        log "Configured minimum disk write: ${MIN_DISK_MBPS} MB/s"
+        if awk "BEGIN {exit !($DISK_Mbps >= $MIN_DISK_MBPS)}"; then
+            pass "Disk write threshold passed (${DISK_Mbps} >= ${MIN_DISK_MBPS} MB/s)."
+        else
+            fail "Disk write threshold failed (${DISK_Mbps} < ${MIN_DISK_MBPS} MB/s)."
+        fi
+    else
+        fail "Disk write benchmark failed."
+    fi
+else
+    warn "dd is unavailable; skipped disk throughput test."
+fi
+
+section "3) Hugging Face download speed"
+log "Testing a ${HF_TEST_MB} MB range from:"
+log "$HF_TEST_URL"
+
+HF_MBPS=""
+if command -v python3 >/dev/null 2>&1; then
+    HF_BYTES=$((HF_TEST_MB * 1024 * 1024))
+    if HF_TEST_URL="$HF_TEST_URL" HF_TOKEN="${HF_TOKEN:-}" HF_BYTES="$HF_BYTES" HF_TIMEOUT="$HF_TIMEOUT" python3 - <<'PY' > "$TMP_DIR/hf.out" 2> "$TMP_DIR/hf.err"
+import os
+import time
+import urllib.request
+
+url = os.environ["HF_TEST_URL"]
+target = int(os.environ["HF_BYTES"])
+timeout = int(os.environ["HF_TIMEOUT"])
+token = os.environ.get("HF_TOKEN", "")
+
+req = urllib.request.Request(url, headers={"Range": f"bytes=0-{target-1}"})
+if token:
+    req.add_header("Authorization", f"Bearer {token}")
+
+read_total = 0
+start = time.perf_counter()
+with urllib.request.urlopen(req, timeout=timeout) as resp:
+    while read_total < target:
+        chunk = resp.read(min(1024 * 1024, target - read_total))
+        if not chunk:
+            break
+        read_total += len(chunk)
+
+elapsed = time.perf_counter() - start
+
+print(f"BYTES={read_total}")
+print(f"SECONDS={elapsed:.3f}")
+print(f"MBPS={read_total/elapsed/1e6:.2f}")
+print(f"HTTP={getattr(resp, 'status', 'unknown')}")
+PY
+    then
+        cat "$TMP_DIR/hf.out"
+        HF_MBPS="$(awk -F= '/^MBPS=/{print $2}' "$TMP_DIR/hf.out")"
+        HF_HTTP="$(awk -F= '/^HTTP=/{print $2}' "$TMP_DIR/hf.out")"
+        if [[ -n "$HF_MBPS" ]]; then
+            log "Configured minimum HF speed: ${MIN_HF_MBPS} MB/s"
+            if awk "BEGIN {exit !($HF_MBPS >= $MIN_HF_MBPS)}"; then
+                pass "Hugging Face speed threshold passed (${HF_MBPS} >= ${MIN_HF_MBPS} MB/s; HTTP ${HF_HTTP})."
+            else
+                fail "Hugging Face speed threshold failed (${HF_MBPS} < ${MIN_HF_MBPS} MB/s; HTTP ${HF_HTTP})."
+            fi
+        else
+            warn "Hugging Face test returned no usable speed value."
+        fi
+    else
+        fail "Hugging Face test failed: $(tr '\n' ' ' < "$TMP_DIR/hf.err")"
+    fi
+else
+    warn "python3 is unavailable; skipped Hugging Face speed test."
+fi
+
+section "4) Exact SAM2 / GitHub preflight"
+log "Testing the dependency that commonly stalls at:"
+log "  Updating ${SAM2_GIT_URL}"
+log "Cold-cache test timeout: ${SAM2_TIMEOUT}s"
+
+SAM2_SECONDS=""
+SAM2_METHOD=""
+if command -v uv >/dev/null 2>&1 && [[ -x "$PYTHON" ]]; then
+    SAM2_METHOD="uv pip install --dry-run --no-deps (cold cache)"
+    log "Using uv's dry-run VCS resolution so the environment is not modified."
+    start_epoch="$(date +%s.%N)"
+    if UV_CACHE_DIR="$TMP_DIR/uv-cache" timeout "$SAM2_TIMEOUT" \
+        uv pip install --dry-run --no-deps --python "$PYTHON" \
+        "git+${SAM2_GIT_URL#git+}" \
+        > "$TMP_DIR/sam2.out" 2>&1; then
+        rc=0
+    else
+        rc=$?
+    fi
+    end_epoch="$(date +%s.%N)"
+    SAM2_SECONDS="$(awk -v s="$start_epoch" -v e="$end_epoch" 'BEGIN {printf "%.2f", e-s}')"
+
+    tail -n 25 "$TMP_DIR/sam2.out" || true
+
+    if [[ "$rc" -eq 0 ]]; then
+        log "SAM2 uv VCS resolution time: ${SAM2_SECONDS}s"
+        if awk "BEGIN {exit !($SAM2_SECONDS <= $MAX_SAM2_SECONDS)}"; then
+            pass "SAM2 GitHub/uv threshold passed (${SAM2_SECONDS}s <= ${MAX_SAM2_SECONDS}s)."
+        else
+            fail "SAM2 GitHub/uv threshold failed (${SAM2_SECONDS}s > ${MAX_SAM2_SECONDS}s)."
+        fi
+    elif [[ "$rc" -eq 124 ]]; then
+        fail "SAM2 GitHub/uv test exceeded ${SAM2_TIMEOUT}s and was terminated."
+    else
+        fail "SAM2 GitHub/uv test failed with exit code ${rc}."
+    fi
+else
+    if command -v git >/dev/null 2>&1; then
+        SAM2_METHOD="git clone --depth 1 --filter=blob:none"
+        start_epoch="$(date +%s.%N)"
+        if timeout "$SAM2_TIMEOUT" git clone --depth 1 --filter=blob:none --no-tags "$SAM2_GIT_URL" "$TMP_DIR/sam2" > "$TMP_DIR/sam2.out" 2>&1; then
+            rc=0
+        else
+            rc=$?
+        fi
+        end_epoch="$(date +%s.%N)"
+        SAM2_SECONDS="$(awk -v s="$start_epoch" -v e="$end_epoch" 'BEGIN {printf "%.2f", e-s}')"
+        tail -n 25 "$TMP_DIR/sam2.out" || true
+        if [[ "$rc" -eq 0 ]]; then
+            log "SAM2 Git clone time: ${SAM2_SECONDS}s"
+            if awk "BEGIN {exit !($SAM2_SECONDS <= $MAX_SAM2_SECONDS)}"; then
+                pass "SAM2 GitHub threshold passed (${SAM2_SECONDS}s <= ${MAX_SAM2_SECONDS}s)."
+            else
+                fail "SAM2 GitHub threshold failed (${SAM2_SECONDS}s > ${MAX_SAM2_SECONDS}s)."
+            fi
+        elif [[ "$rc" -eq 124 ]]; then
+            fail "SAM2 GitHub clone exceeded ${SAM2_TIMEOUT}s and was terminated."
+        else
+            fail "SAM2 GitHub clone failed with exit code ${rc}."
+        fi
+    else
+        fail "Neither uv nor git is available to test the SAM2 dependency."
+    fi
+fi
+
+section "5) Quick connectivity latency"
+if command -v git >/dev/null 2>&1; then
+    start_epoch="$(date +%s.%N)"
+    if git ls-remote --heads "$SAM2_GIT_URL" >/dev/null 2>&1; then
+        end_epoch="$(date +%s.%N)"
+        git_latency="$(awk -v s="$start_epoch" -v e="$end_epoch" 'BEGIN {printf "%.2f", e-s}')"
+        pass "GitHub ls-remote succeeded in ${git_latency}s."
+    else
+        fail "GitHub ls-remote failed."
+    fi
+fi
+
+section "Decision"
+log "GPU:              ${GPU_NAME:-not measured}"
+log "GPU GEMM:          ${GPU_TFLOPS:-not measured} TFLOPS"
+log "VRAM:              ${VRAM_GB:-not measured} GB"
+log "Disk write:        ${DISK_Mbps:-not measured} MB/s"
+log "Hugging Face:      ${HF_MBPS:-not measured} MB/s"
+log "SAM2/uv Git:       ${SAM2_SECONDS:-not measured} s"
+log ""
+
+if [[ -n "$HF_MBPS" ]] && awk "BEGIN {print ($HF_MBPS > 0)}" >/dev/null; then
+    estimated_min="$(awk -v b="$TOTAL_H3_ASSET_BYTES" -v mbps="$HF_MBPS" 'BEGIN {printf "%.1f", b/mbps/1e6/60}')"
+    log "Rough single-stream estimate for the ~40 GB H3 asset bundle: ${estimated_min} minutes at ${HF_MBPS} MB/s."
+    log "Actual bootstrap time can be lower/higher because it uses parallel downloads and different hosts."
+fi
+
+log ""
+log "Passes: ${PASS_COUNT}   Warnings: ${WARN_COUNT}   Failures: ${FAIL_COUNT}"
+
+if (( FAIL_COUNT > 0 )); then
+    log ""
+    log "RESULT: ❌ DO NOT RUN THE FULL BOOTSTRAP on this rental under the current thresholds."
+    log "Adjust thresholds with environment variables when you intentionally accept slower hardware/network."
+    exit 1
+else
+    log ""
+    log "RESULT: ✅ Preflight passed. Running the full bootstrap is reasonable under the configured thresholds."
+    exit 0
+fi
