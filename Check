@@ -431,20 +431,19 @@ if command -v git >/dev/null 2>&1 && [[ -x "$PYTHON" ]]; then
 
             # Force build errors to be fatal for this benchmark. The normal SAM2
             # installer allows build errors by default; the preflight should not.
-            start_epoch="$(date +%s.%N)"
-            if (
-                cd "$TMP_DIR/sam2"
-                SAM2_BUILD_CUDA=1 \
-                SAM2_BUILD_ALLOW_ERRORS=0 \
-                MAX_JOBS="${MAX_JOBS:-8}" \
-                timeout "$SAM2_BUILD_TIMEOUT" \
-                    "$PYTHON" setup.py build_ext --inplace -v
-            ) > "$TMP_DIR/sam2-build.out" 2>&1; then
-                build_rc=0
-            else
-                build_rc=$?
-            fi
-
+           start_epoch="$(date +%s.%N)"
+if (
+    cd "$TMP_DIR/sam2"
+    SAM2_BUILD_CUDA=1 \
+    SAM2_BUILD_ALLOW_ERRORS=0 \
+    MAX_JOBS="${MAX_JOBS:-8}" \
+    timeout "$SAM2_BUILD_TIMEOUT" \
+        "$PYTHON" setup.py build_ext --inplace -v
+) > "$TMP_DIR/sam2-build.out" 2>&1; then
+    build_rc=0
+else
+    build_rc=$?
+fi
             end_epoch="$(date +%s.%N)"
             SAM2_BUILD_SECONDS="$(awk -v s="$start_epoch" -v e="$end_epoch" 'BEGIN {printf "%.2f", e-s}')"
 
