@@ -61,9 +61,9 @@ DISK_RESERVE_GB="${DISK_RESERVE_GB:-8}"
 ARIA2_SPLIT="${ARIA2_SPLIT:-8}"
 ARIA2_CONNECTIONS="${ARIA2_CONNECTIONS:-8}"
 MAX_PARALLEL_DOWNLOADS="${MAX_PARALLEL_DOWNLOADS:-3}"
+MAX_PARALLEL_GIT_CLONES="${MAX_PARALLEL_GIT_CLONES:-4}"
 CLEAN_PIP_CACHE="${CLEAN_PIP_CACHE:-true}"
 
-CLEAN_PIP_CACHE="${CLEAN_PIP_CACHE:-true}"
 LOG_FILE="${WORKSPACE}/setup.log"
 COMFY_LOG="${WORKSPACE}/comfyui-bootstrap.log"
 PIN_FILE="${WORKSPACE}/comfyui-seed-hunter-node-pins.txt"
@@ -537,45 +537,146 @@ clone_or_update_node() {
     return 0
 }
 
+# ----------------------- Parallel Git clone queue ------------------------------
+GIT_PIDS=()
+GIT_LABELS=()
+
+wait_for_git_slot() {
+    while ((${#GIT_PIDS[@]} >= MAX_PARALLEL_GIT_CLONES)); do
+        local pid="${GIT_PIDS[0]}"
+        local label="${GIT_LABELS[0]}"
+
+        if wait "$pid"; then
+            echo "✅ Git job completed: $label"
+        else
+            echo "❌ Git job failed: $label"
+            append_failure "node clone/update: $label"
+        fi
+
+        GIT_PIDS=("${GIT_PIDS[@]:1}")
+        GIT_LABELS=("${GIT_LABELS[@]:1}")
+    done
+}
+
+parallel_clone_or_update() {
+    local label="$1"
+    shift
+
+    (
+        clone_or_update_node "$@"
+    ) &
+
+    GIT_PIDS+=("$!")
+    GIT_LABELS+=("$label")
+
+    wait_for_git_slot
+}
+
+wait_for_all_git() {
+    while ((${#GIT_PIDS[@])); do
+        local pid="${GIT_PIDS[0]}"
+        local label="${GIT_LABELS[0]}"
+
+        if wait "$pid"; then
+            echo "✅ Git job completed: $label"
+        else
+            echo "❌ Git job failed: $label"
+            append_failure "node clone/update: $label"
+        fi
+
+        GIT_PIDS=("${GIT_PIDS[@]:1}")
+        GIT_LABELS=("${GIT_LABELS[@]:1}")
+    done
+}
+
+# -------------------- Shared node dependency install --------------------------
+NODE_REQUIREMENTS_FILE="${WORKSPACE}/.seed_hunter-node-requirements.txt"
+
+build_node_requirements() {
+    : > "$NODE_REQUIREMENTS_FILE"
+
+    for repo in "${REPOS[@]}"; do
+        local node_dir
+        local dest
+
+        node_dir="$(basename "$repo" .git)"
+        dest="$COMFY_DIR/custom_nodes/$node_dir"
+
+        # Skip nodes whose clone/update failed.
+        [[ -d "$dest/.git" ]] || continue
+
+        # Frame Interpolation uses its no-CuPy requirements instead of
+        # requirements.txt; CuPy is installed separately.
+        if [[ "$node_dir" == "ComfyUI-Frame-Interpolation" ]]; then
+            if [[ -f "$dest/requirements-no-cupy.txt" ]]; then
+                printf '%s\n' "-r $dest/requirements-no-cupy.txt" >> "$NODE_REQUIREMENTS_FILE"
+            fi
+        elif [[ -f "$dest/requirements.txt" ]]; then
+            printf '%s\n' "-r $dest/requirements.txt" >> "$NODE_REQUIREMENTS_FILE"
+        fi
+    done
+
+    # cg-use-everywhere declares comfyui-frontend-package in pyproject.toml.
+    # The official ComfyUI image already provides the frontend package, so only
+    # add it if it is actually missing.
+    if ! uv_pip show comfyui-frontend-package >/dev/null 2>&1; then
+        printf '%s\n' "comfyui-frontend-package>=1.25.0" >> "$NODE_REQUIREMENTS_FILE"
+    fi
+}
+
+install_all_node_requirements() {
+    build_node_requirements
+
+    if [[ ! -s "$NODE_REQUIREMENTS_FILE" ]]; then
+        echo "ℹ️ No shared node requirements to install."
+        return 0
+    fi
+
+    echo ""
+    echo "================ Shared Python Dependencies ================"
+    echo "📦 Installing node dependencies in one uv transaction..."
+
+    uv_pip install -r "$NODE_REQUIREMENTS_FILE"
+}
+
 install_node_dependencies() {
     local node_dir="$1"
     local dest="$COMFY_DIR/custom_nodes/$node_dir"
 
-    echo "🔧 Installing dependencies for $node_dir..."
+    echo "🔧 Finalizing $node_dir..."
 
     case "$node_dir" in
+
         ComfyUI-Frame-Interpolation)
-            # The upstream install.py currently maps CUDA only through 12.x.
-            # On CUDA 13, use the project's requirements-no-cupy.txt and install
-            # CuPy's official CUDA-13 wheel explicitly. Current upstream runtime
-            # code also dynamically discovers CUDA_HOME for its CuPy RawModule.
-            # This avoids using the main-branch installer path that still lacks
-            # CUDA-13 package mapping.
-            if [[ "$FRAME_INTERPOLATION_CUDA13" == "disable" && "$CUDA_FAMILY" == "13x" ]]; then
-                echo "⚠️ FRAME_INTERPOLATION_CUDA13=disable; skipping Frame Interpolation on CUDA 13."
-                return 1
-            fi
+            # Common dependencies were installed in the shared transaction.
+            # CuPy remains separate because the correct package depends on
+            # the CUDA family detected from the image's PyTorch build.
 
-            echo "   -> Installing Frame Interpolation common requirements..."
-            uv_pip install --no-cache -r "$dest/requirements-no-cupy.txt"
+            echo "   -> Selecting CuPy package for CUDA family: $CUDA_FAMILY"
 
-            echo "   -> Selecting CuPy package automatically for CUDA family: $CUDA_FAMILY"
             uv_pip uninstall -y \
-                cupy cupy-wheel cupy-cuda102 cupy-cuda110 cupy-cuda111 cupy-cuda11x cupy-cuda12x cupy-cuda13x \
+                cupy \
+                cupy-wheel \
+                cupy-cuda102 \
+                cupy-cuda110 \
+                cupy-cuda111 \
+                cupy-cuda11x \
+                cupy-cuda12x \
+                cupy-cuda13x \
                 >/dev/null 2>&1 || true
 
             case "$CUDA_FAMILY" in
                 13x)
-                    uv_pip install --no-cache "cupy-cuda13x"
+                    uv_pip install "cupy-cuda13x"
                     ;;
                 12x)
-                    uv_pip install --no-cache "cupy-cuda12x"
+                    uv_pip install "cupy-cuda12x"
                     ;;
                 11x)
-                    uv_pip install --no-cache "cupy-cuda11x"
+                    uv_pip install "cupy-cuda11x"
                     ;;
                 102)
-                    uv_pip install --no-cache "cupy-cuda102"
+                    uv_pip install "cupy-cuda102"
                     ;;
                 *)
                     echo "❌ No supported CuPy mapping for CUDA family $CUDA_FAMILY"
@@ -583,60 +684,55 @@ install_node_dependencies() {
                     ;;
             esac
 
-            # The project uses CUDA_HOME while compiling its RawModule kernels.
-            # Prefer PyTorch's bundled CUDA component directory when present.
-            TORCH_CUDA_LIB="$($PYTHON_CMD -c 'from pathlib import Path; import torch; p=Path(torch.__file__).parent / "lib"; print(p if (p / "libnvrtc-builtins.so").exists() or any(p.glob("*nvrtc-builtins*")) else "")' 2>/dev/null || true)"
+            # Frame Interpolation uses CUDA_HOME while compiling RawModule kernels.
+            TORCH_CUDA_LIB="$($PYTHON_CMD -c '
+from pathlib import Path
+import torch
+p = Path(torch.__file__).parent / "lib"
+print(p if (p / "libnvrtc-builtins.so").exists() or any(p.glob("*nvrtc-builtins*")) else "")
+' 2>/dev/null || true)"
+
             if [[ -n "$TORCH_CUDA_LIB" ]]; then
                 export CUDA_HOME="$TORCH_CUDA_LIB"
                 export CUDA_PATH="$TORCH_CUDA_LIB"
-                echo "   -> CUDA_HOME set to PyTorch CUDA component directory: $CUDA_HOME"
+                echo "   -> CUDA_HOME: $CUDA_HOME"
             elif [[ -d /usr/local/cuda ]]; then
                 export CUDA_HOME=/usr/local/cuda
                 export CUDA_PATH=/usr/local/cuda
-                echo "   -> CUDA_HOME set to: $CUDA_HOME"
+                echo "   -> CUDA_HOME: $CUDA_HOME"
             fi
             ;;
 
         ComfyUI-Impact-Pack)
-            # Impact Pack has its own installer and can also provision SAM/ONNX
-            # model assets. INSTALL_IMPACT_MODELS=false creates its documented
-            # skip sentinel only for this run, then removes it.
+            # Requirements were installed in the shared transaction.
+            # Run Impact Pack's own installer afterward.
+            echo "   -> Running Impact Pack installer..."
+
             if [[ "$INSTALL_IMPACT_MODELS" == "true" ]]; then
-                (cd "$dest" && \
+                (
+                    cd "$dest"
                     COMFYUI_PATH="$COMFY_DIR" \
                     COMFYUI_MODEL_PATH="$COMFY_DIR/models" \
-                    "$PYTHON_CMD" install.py)
+                    "$PYTHON_CMD" install.py
+                )
             else
                 touch "$COMFY_DIR/custom_nodes/skip_download_model"
-                (cd "$dest" && \
+
+                (
+                    cd "$dest"
                     COMFYUI_PATH="$COMFY_DIR" \
                     COMFYUI_MODEL_PATH="$COMFY_DIR/models" \
-                    "$PYTHON_CMD" install.py)
+                    "$PYTHON_CMD" install.py
+                )
+
                 rm -f "$COMFY_DIR/custom_nodes/skip_download_model"
             fi
             ;;
 
-        ComfyUI-Pixaroma)
-            # Pixaroma declares imageio-ffmpeg in pyproject.toml.
-            uv_pip install --no-cache -r "$dest/requirements.txt"
-            ;;
-
-        ComfyUI-H3-Prompt-IDE)
-            echo "   ℹ️ H3 Prompt IDE has no Python dependencies; skipping package installation."
-            ;;
-
         *)
-            if [[ -f "$dest/requirements.txt" ]]; then
-                uv_pip install --no-cache -r "$dest/requirements.txt"
-            elif [[ -f "$dest/pyproject.toml" ]]; then
-                # Some ComfyUI extensions use pyproject.toml without a separate
-                # requirements.txt. Install them editable so declared deps land
-                # in the ComfyUI venv.
-                uv_pip install --no-cache -e "$dest"
-            else
-                echo "   ℹ️ No requirements.txt/pyproject.toml found; no pip install needed."
-            fi
+            echo "   -> Shared dependencies already installed."
             ;;
+
     esac
 }
 
@@ -698,12 +794,33 @@ verify_node_install() {
 # --------------------------- Install custom nodes ----------------------------
 echo ""
 echo "================ Custom Nodes ================"
+
+# Phase 1: clone/update repositories in parallel.
 for repo in "${REPOS[@]}"; do
     node_dir="$(basename "$repo" .git)"
     pin="$(get_pin "$node_dir" || true)"
 
-    if ! clone_or_update_node "$repo" "$node_dir" "$pin"; then
-        append_failure "node clone/update: $node_dir"
+    parallel_clone_or_update \
+        "$node_dir" \
+        "$repo" \
+        "$node_dir" \
+        "$pin"
+done
+
+# Make sure every clone/update has finished before touching the shared
+# Python environment.
+wait_for_all_git
+
+install_all_node_requirements || {
+    append_failure "shared node dependencies"
+}
+
+# Phase 2: install dependencies sequentially.
+for repo in "${REPOS[@]}"; do
+    node_dir="$(basename "$repo" .git)"
+
+    if [[ ! -d "$COMFY_DIR/custom_nodes/$node_dir/.git" ]]; then
+        echo "⏭️ Skipping dependency installation for $node_dir because clone/update failed."
         continue
     fi
 
@@ -754,7 +871,7 @@ mkdir -p \
     "$COMFY_DIR/models/latent_upscale_models" \
     "$COMFY_DIR/models/loras" \
     "$COMFY_DIR/models/vae" \
-    "$COMFY_DIR/models/vae_approx" \
+    "$COMFY_DIR/models/vae_approx" 
 
 # ------------------------- Download helpers ----------------------------------
 # Fetch the primary SHA-256 recorded by Civitai for a model version.
