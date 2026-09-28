@@ -547,7 +547,7 @@ _for_git_slot() {
         local pid="${GIT_PIDS[0]}"
         local label="${GIT_LABELS[0]}"
 
-        if  "$pid"; then
+        if wait "$pid"; then
             echo "✅ Git job completed: $label"
         else
             echo "❌ Git job failed: $label"
@@ -578,7 +578,7 @@ _for_all_git() {
         local pid="${GIT_PIDS[0]}"
         local label="${GIT_LABELS[0]}"
 
-        if  "$pid"; then
+        if wait "$pid"; then
             echo "✅ Git job completed: $label"
         else
             echo "❌ Git job failed: $label"
