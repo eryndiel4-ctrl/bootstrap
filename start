@@ -643,7 +643,11 @@ install_all_node_requirements() {
     echo "================ Shared Python Dependencies ================"
     echo "📦 Installing node dependencies in one uv transaction..."
 
-    uv_pip install -r "$NODE_REQUIREMENTS_FILE"
+    uv_pip install "setuptools>=61.0"
+
+SAM2_BUILD_CUDA=0 uv_pip install -v \
+    --no-build-isolation-package sam-2 \
+    -r "$NODE_REQUIREMENTS_FILE"
 }
 
 install_node_dependencies() {
